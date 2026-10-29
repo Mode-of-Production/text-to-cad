@@ -75,11 +75,8 @@ def parse_feed(data: Any) -> dict[str, Any] | None:
 def checking() -> bool:
     """Whether to check at all: not turned off (``CADGEN_UPDATE_CHECK=0``), not in CI, and a copy
     that is told -- not one something else keeps up to date, nor a development install."""
-    if str(os.environ.get("CADGEN_UPDATE_CHECK") or "").strip().lower() in _OFF:
-        return False
-    if str(os.environ.get("CI") or "").strip().lower() not in ("", *_OFF):
-        return False
-    return told()
+    # MoP fork 2026-10-29: telemetry and the version check are disabled at source. No request leaves this process.
+    return False
 
 
 def _cache() -> Path:
@@ -115,15 +112,9 @@ def _due(kept: dict[str, Any], key: str, now: float) -> bool:
 
 def _get(url: str) -> Any:
     """The feed's JSON, or ``None`` when it could not be read: offline, slow, refused, or not JSON."""
-    try:
-        import urllib.request
-
-        request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "cadgen"})
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310 - http(s) only (`api_url`)
-            return json.loads(response.read(MAX_BYTES))
-    except Exception:  # noqa: BLE001 - a check that fails is tried again tomorrow
-        LOG.debug("could not read the version feed at %s", url, exc_info=True)
-        return None
+    # MoP fork 2026-10-29: telemetry and the version check are disabled at source. No request leaves this process.
+    LOG.debug("version feed %s suppressed (MoP fork)", url)
+    return None
 
 
 def feed(*, fetch: bool = True, now: float | None = None, path: Path | None = None,

@@ -581,11 +581,8 @@ ENVIRONMENT = ("DO_NOT_TRACK", "CADGEN_TELEMETRY")
 
 
 def _environment(env: Any = None) -> bool | None:
-    env = os.environ if env is None else env
-    if str(env.get("DO_NOT_TRACK") or "").strip().lower() in _ON:
-        return False
-    value = str(env.get("CADGEN_TELEMETRY") or "").strip().lower()
-    return False if value in _OFF else True if value in _ON else None
+    # MoP fork 2026-10-29: telemetry and the version check are disabled at source. No request leaves this process.
+    return False
 
 
 def for_others(env: Mapping[str, str]) -> dict[str, str]:
@@ -819,22 +816,9 @@ def told_at(path: Path | None = None) -> float | None:
 def _post(url: str, payload: dict[str, Any] | None = None, *, method: str = "POST") -> str:
     """``ok`` (taken), ``refused`` (read and never to be taken: ``REFUSED``) or ``failed`` (offline,
     slow, broken or not there yet: worth trying again)."""
-    try:
-        import urllib.error
-        import urllib.request
-
-        data = json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else None
-        request = urllib.request.Request(url, data=data, method=method,
-                                         headers={"Content-Type": "application/json", "User-Agent": "cadgen"})
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310 - http(s) only (`endpoint`)
-                return "ok" if 200 <= response.status < 300 else "failed"
-        except urllib.error.HTTPError as refusal:
-            LOG.debug("telemetry %s %s answered %s", method, url, refusal.code)
-            return "refused" if refusal.code in REFUSED else "failed"
-    except Exception:  # noqa: BLE001 - telemetry never fails anything
-        LOG.debug("telemetry %s %s failed", method, url, exc_info=True)
-        return "failed"
+    # MoP fork 2026-10-29: telemetry and the version check are disabled at source. No request leaves this process.
+    LOG.debug("telemetry %s %s suppressed (MoP fork)", method, url)
+    return "refused"
 
 
 def request_deletion(install_id: str) -> bool:
