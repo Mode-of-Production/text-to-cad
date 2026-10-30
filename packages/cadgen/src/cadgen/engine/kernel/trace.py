@@ -2203,8 +2203,26 @@ def _library_roots() -> tuple[Path, ...]:
     # ``.pth`` line or PYTHONPATH reaching another environment's packages (numpy, build123d)
     # makes them no less a library than this interpreter's own.
     entries = [entry for entry in sys.path if entry and Path(entry).name in ("site-packages", "dist-packages")]
+    # And every folder a ``.pth`` file in those packages folders puts on the path: an editable
+    # install is an installed package too, its source folder a library the model calls, never
+    # the model's own (MoP fork: a build forgot such a package's modules, T062b r3 m1).
+    folders = [*site.getsitepackages(), site.getusersitepackages(), *entries]
+    installed = []
+    for folder in folders:
+        try:
+            pth_files = sorted(Path(folder).glob("*.pth"))
+        except OSError:
+            continue
+        for pth in pth_files:
+            try:
+                lines = pth.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            installed += [line.strip() for line in lines
+                          if line.strip() and not line.startswith(("#", "import ", "import	"))
+                          and Path(line.strip()).is_absolute() and Path(line.strip()).is_dir()]
     for value in (sys.prefix, sys.base_prefix, sys.exec_prefix, *site.getsitepackages(), site.getusersitepackages(),
-                  *entries):
+                  *entries, *installed):
         if value:
             try:
                 found.add(Path(value).resolve())
