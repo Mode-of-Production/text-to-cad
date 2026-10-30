@@ -100,6 +100,8 @@ class Part:
     origin: Any = None  # the result's object it was first seen as
     material: Any = None
     face_materials: dict[int, Any] = field(default_factory=dict)
+    # The part's own attributes (``shape.attributes``), sorted (key, value) pairs (``_attributes``).
+    attributes: tuple = ()
 
 
 # The base colour of a part with a material and no colour: the exports' default grey.
@@ -177,6 +179,21 @@ def _rgba(color: Any) -> tuple | None:
     from cadgen.engine.colors import linear
 
     return tuple(linear(color, "a shape's color"))
+
+
+def _attributes(value: Any, path: str) -> tuple:
+    """A part's own attributes as the document holds them: ``shape.attributes``, a dict of
+    text keys to text, integer or real values, as sorted (key, value) pairs; written as
+    ``TDataStd_NamedData`` on the part's label and read back as ``Prototype.attributes``.
+    The engine gives them no meaning. (MoP fork.)"""
+    if not value:
+        return ()
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: attributes is a dict of str to str, int or float, not {type(value).__name__}")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key or isinstance(item, bool) or not isinstance(item, (str, int, float)):
+            raise ValueError(f"{path}: attribute {key!r} is a non-empty str key with a str, int or float value")
+    return tuple(sorted(value.items()))
 
 
 def _material(value: Any) -> Any:
@@ -279,6 +296,7 @@ def collect(result: Any, name: str, harvested: Callable[[tuple], "Harvest | None
         material = own_material or inherited_material
         children = state.get("_NodeMixin__children") or ()
         label = state.get("label") or ""
+        attributes = _attributes(state.get("attributes"), path)
         held = _children(topods) if children and int(topods.ShapeType()) == int(TopAbs_COMPOUND) else []
         if children and len(held) == len(children):
             components = []
@@ -313,14 +331,14 @@ def collect(result: Any, name: str, harvested: Callable[[tuple], "Harvest | None
             face_colors[ordinal] = face_color
         painted = tuple(sorted(face_colors.items()))
         signature = ("part", topods.TShape(), int(topods.Orientation()), painted, material_key(material),
-                     tuple((o, material_key(m)) for o, m in sorted(face_materials.items())))
+                     tuple((o, material_key(m)) for o, m in sorted(face_materials.items())), attributes)
         found = prototypes.get(signature)
         if found is None:
             meshes = mesh_faces(topods)
             if meshes:
                 raise ValueError(_mesh_refused(path, meshes))
             found = Part(topods, label or f"part{len(parts) + 1}", color, dict(painted), origin=obj,
-                         material=material, face_materials=face_materials)
+                         material=material, face_materials=face_materials, attributes=attributes)
             prototypes[signature] = found
             order.append(found)
             parts.append(found)
@@ -533,6 +551,29 @@ def _write_extra(label: Any, material: Any) -> None:
                                             TCollection_ExtendedString(material_key(material), True))
 
 
+def _write_attributes(label: Any, attributes: tuple) -> None:
+    """A part's attributes (``_attributes``) as ``TDataStd_NamedData`` on its label: one string,
+    ``attributes``, holding them as JSON in key order, as the material label holds ``bd_materials``
+    (OCP lists a NamedData's values but not its keys, so typed entries could not be read back)."""
+    from OCP.TCollection import TCollection_ExtendedString
+    from OCP.TDataStd import TDataStd_NamedData
+
+    TDataStd_NamedData.Set_s(label).SetString(TCollection_ExtendedString("attributes"),
+                                            TCollection_ExtendedString(json.dumps(dict(attributes)), True))
+
+
+def _label_attributes(label: Any) -> dict[str, Any]:
+    """The attributes a part's label holds (``_write_attributes``), by key; none, empty."""
+    from OCP.TCollection import TCollection_ExtendedString
+    from OCP.TDataStd import TDataStd_NamedData
+
+    data = TDataStd_NamedData()
+    key = TCollection_ExtendedString("attributes")
+    if _find(label, data, TDataStd_NamedData.GetID_s()) and data.HasString(key):
+        return json.loads(data.GetString(key).ToExtString())
+    return {}
+
+
 def _read_extra(label: Any) -> Any:
     from OCP.TCollection import TCollection_ExtendedString
     from OCP.TDataStd import TDataStd_NamedData
@@ -651,7 +692,8 @@ def _records(tree: Tree) -> list[_Record]:
             material = material_key(prototype.material)
             base = prototype.color or DEFAULT_COLOR
             found.append(_Record(
-                ("part", apart, prototype.name, prototype.color, material, painted, given, prototype.key),
+                ("part", apart, prototype.name, prototype.color, material, painted, given, prototype.key,
+                 prototype.attributes),
                 shape=prototype.shape, names=prototype.names,
                 colours=((prototype.color,) if prototype.color is not None else ())
                 + tuple(rgba for _, rgba in painted),
@@ -796,6 +838,8 @@ class _Converter:
             materials.set(label, prototype.material, prototype.color or DEFAULT_COLOR)
         if prototype.key:
             TDataStd_AsciiString.Set_s(label, self.key_guid, TCollection_AsciiString(prototype.key))
+        if prototype.attributes:
+            _write_attributes(label, prototype.attributes)
         faces = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
         TopExp.MapShapes_s(shape, TopAbs_FACE, faces)
         face_names = (prototype.names or {}).get("faces") or []
@@ -1342,6 +1386,7 @@ class Prototype:
     material: Any = None
     face_materials: dict[int, Any] = field(default_factory=dict)
     vertex_names: dict[int, str] = field(default_factory=dict)
+    attributes: dict[str, Any] = field(default_factory=dict)  # the part's own (``_label_attributes``)
 
 
 @dataclass
@@ -1507,6 +1552,7 @@ class Loaded:
                 "faceColors": {str(k): v for k, v in sorted(p.face_colors.items())},
                 "material": material_json(p.material),
                 "faceMaterials": {str(k): material_json(v) for k, v in sorted(p.face_materials.items())},
+                **({"attributes": dict(p.attributes)} if p.attributes else {}),
             } for p in self.prototypes],
             "instances": [{"prototype": i.prototype, "path": "/".join(i.path), "matrix": i.matrix, "color": i.color}
                           for i in self.instances],
@@ -1592,7 +1638,8 @@ def tree_structure(tree: Tree, path: Path) -> dict[str, Any]:
                 "vertexNames": {str(k): v for k, v in sorted(vertex_names.items())},
                 "faceColors": {str(k): v for k, v in sorted(face_colors.items())},
                 "material": material_json(material),
-                "faceMaterials": {str(k): material_json(v) for k, v in sorted(face_materials.items())}}
+                "faceMaterials": {str(k): material_json(v) for k, v in sorted(face_materials.items())},
+                **({"attributes": dict(part.attributes)} if part.attributes else {})}
 
     paths: list[tuple[int, ...]] = []
 
@@ -2019,7 +2066,7 @@ def _prototype(index: int, label: Any, shape: Any, entry: str, loaded: Loaded) -
     name = step_name(_label_name(label)) if loaded.step else _label_name(label)
     return Prototype(index, local, name or f"part{index + 1}", part_color, found_key,
                      face_names, edge_names, face_colors, entry, part_material, face_materials,
-                     vertex_names=vertex_names)
+                     vertex_names=vertex_names, attributes=_label_attributes(label))
 
 
 
