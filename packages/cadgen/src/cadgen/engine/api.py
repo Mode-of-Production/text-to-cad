@@ -393,7 +393,9 @@ def _built(script: Path, functions: list[str] | None, *, verify: bool = False, p
                 shown(message["log"] if message.get("stream") == "model" else f"  {message['log']}")
 
             order = {"op": "build", "script": str(script), "functions": functions,
-                     "cwd": str(cwd), "verify": verify, "profile": profile, "run": _run(), "program": _program()}
+                     "cwd": str(cwd), "verify": verify, "profile": profile, "run": _run(), "program": _program(),
+                     # ``cadgen run --json``: this build's documents saved before it answers (``Cache.save_now``)
+                     "save": bool(os.environ.get("CADGEN_REPORT_JSON"))}
             try:
                 answer = _ask(order, relay, frames)
             except EngineError as error:

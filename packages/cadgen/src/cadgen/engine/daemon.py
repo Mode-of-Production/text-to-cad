@@ -670,6 +670,19 @@ def refused(error: Exception) -> dict[str, Any]:
     return found
 
 
+def _documents(answer: dict[str, Any]) -> list[str]:
+    """The model documents a build's answer says it built: each report and child model that is ok
+    and has an id (the ones ``models.Models.register`` records), in report order."""
+    done = answer.get("done")
+    reports = done.get("reports") if isinstance(done, dict) else done
+    found: list[str] = []
+    for root in reports if isinstance(reports, list) else []:
+        for report in [root, *(root.get("child_models") or {}).values()]:
+            if report.get("ok") and report.get("id") and report["id"] not in found:
+                found.append(report["id"])
+    return found
+
+
 def _read_exactly(stream: Any, size: int) -> bytes:
     chunks = []
     while size:
@@ -2231,6 +2244,9 @@ class Daemon:
                         # The program that asked: what a document it built names to build it again.
                         answer["program"] = request.get("program")
                         self._built(worker, answer)
+                        if request.get("save"):
+                            # The build asked its documents saved now: cache file and record before the answer.
+                            self.models.cache.save_now(_documents(answer))
                         send(answer)
                         return
                     except WorkerGone as error:

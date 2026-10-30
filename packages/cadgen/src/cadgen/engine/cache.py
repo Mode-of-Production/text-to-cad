@@ -355,6 +355,34 @@ class Cache:
             self.failures.appendleft({"id": ident, "error": error, "at": time.time()})
         print(f"cadgen engine: the cache could not save {ident}: {error}", file=sys.stderr, flush=True)
 
+    def save_now(self, idents: list[str], seconds: float = SHUTDOWN_SECONDS) -> list[str]:
+        """Documents ``idents`` saved now, not at their idle timer: what a build that asks ``save``
+        waits on before its answer (``cadgen run --json``), so its cache file and its record's ``cache``
+        are there when the run returns. Each is saved as its idle timer would save it (``_due``),
+        within ``seconds`` in all. The ids not saved at their revision by then (a save that failed,
+        no cache folder); empty when every one is."""
+        deadline = time.monotonic() + seconds
+        with self.lock:
+            for ident in idents:
+                self.due.pop(ident, None)
+            self._start()
+        for ident in idents:
+            try:
+                self._due(ident)
+            except Exception as error:  # noqa: BLE001 - a save never fails anyone
+                self.failed(ident, f"{type(error).__name__}: {error}")
+
+        def unsaved() -> list[str]:
+            rows = {ident: self.models.row(ident) for ident in idents}
+            return [ident for ident, row in rows.items() if row is None or not self.current(ident, row["revision"])]
+
+        with self.lock:
+            while (left := unsaved()) and time.monotonic() < deadline:
+                if not (self.saving or self.writes or self.working):
+                    break  # nothing under way that could still save them
+                self.lock.wait(max(0.005, min(0.1, deadline - time.monotonic())))
+        return left
+
     # --- the end ---------------------------------------------------------------------------
 
     def final(self, seconds: float = SHUTDOWN_SECONDS) -> None:

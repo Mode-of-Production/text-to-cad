@@ -14,9 +14,14 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args[:1] in (["-h"], ["--help"]):
-        sys.stdout.write("usage: cadgen run SCRIPT.py [ARGS...] | -m MODULE [ARGS...] | -c CODE\n\n"
+        sys.stdout.write("usage: cadgen run [--json] SCRIPT.py [ARGS...] | -m MODULE [ARGS...] | -c CODE\n\n"
                          "Run this installation's python with the arguments (a model script builds by running it).\n")
         return 0
+    if args[:1] == ["--json"]:
+        # The run's report as one JSON line, and its documents saved before the build answers: the
+        # client asks both of each build it sends (``api._built``), in this run's process only.
+        args = args[1:]
+        os.environ["CADGEN_REPORT_JSON"] = "1"
     command = [sys.executable, *args]
     if os.name == "nt":  # no exec on Windows: a child, and its exit code
         import subprocess

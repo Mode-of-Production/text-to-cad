@@ -257,7 +257,8 @@ class Model:
         finally:
             _CONTEXT.program = previous
         if program:
-            _reported(built.models, built.wall, built.fresh, False)
+            as_json = bool(os.environ.get("CADGEN_REPORT_JSON"))
+            _reported(built.models, built.wall, built.fresh, as_json)
         if not built.ok:
             error = api.EngineError(next(row.get("error", "model failed") for row in built.models if not row.get("ok")))
             if program:
