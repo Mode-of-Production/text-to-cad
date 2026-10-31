@@ -19,7 +19,17 @@ built tree. The pairs make a mechanism in ISO 10303-105's terms, the kinematics 
   are connected are one link. The **ground** link is every link no ``connect_to`` moved
   (the joint whose ``connect_to`` was called stays put; the other's part moves), with every
   part placed by no joint; a part below a jointed sub-assembly moves with it, the one
-  holding an inner pair's moving joint (its base) too (``_enclose``).
+  holding an inner pair's moving joint (its base) too (``_enclose``). When no moving pair
+  exists (``pairs`` is empty), ``links`` are the connected components of ``rigid_edges`` in
+  occurrence-path order (empty when ``rigid_edges`` is empty) and ``ground`` is ``0``
+  (``links[0]``, the first rigid component by occurrence path; ``MECHANISM_REPRESENTATION``'s
+  base reference names ``links[0]``, any other rigid component stays an unreached link, and
+  ``block`` assigns every unfastened instance to ``ground``). A pair-less ``kinematics``
+  block is written under ``0:1:100`` and in ``structure()["kinematics"]`` whenever
+  ``rigid_edges`` or ``warnings`` is non-empty so the document and structure persist rigid
+  components and fastening edges for load-path checks and carry harvest warnings through
+  ``document.collect`` to the build report (when neither ``moving_pairs``, ``rigid_edges``
+  nor ``warnings`` exists, ``harvest`` returns ``None`` and no kinematics block is written).
 - **Pairs** join two links: a revolute joint is a ``REVOLUTE_PAIR``, a linear one a
   ``PRISMATIC_PAIR``, a cylindrical one a ``CYLINDRICAL_PAIR``, a ball a ``SPHERICAL_PAIR``,
   each ``_WITH_RANGE`` where the joint has finite limits. A pair is named by its moving
@@ -104,6 +114,9 @@ name (``test_kinematics``' conformance test holds it):
             :k                 NamedData{entity: KinematicPairWithMotionCoupling, Kind,
                                          CouplingRatios[2], CouplingTypes}, ReferenceList[pair, pair]
                                | NamedData{entity: SCREW_PAIR, pitch}, ReferenceList[the cylindrical pair]
+        :7 "rigid_edges"
+          :r <label>           the rigid joint's label
+            :1, :2             AssemblyItemRef(the two occurrences it fastens)
 
 STEP carries none of it: OCCT parses AP242 kinematics into its STEP model and maps none into a
 document, and cadgen's OCP reaches neither.
@@ -235,6 +248,7 @@ class Mechanism:
     warnings: list[str] = field(default_factory=list)
     motions: dict[str, Motion] = field(default_factory=dict)
     couplings: dict[str, Coupling] = field(default_factory=dict)
+    rigid_edges: list[tuple[tuple[int, ...], tuple[int, ...], str]] = field(default_factory=list)
 
     def signature(self) -> tuple:
         return (self.name, tuple((link.name, tuple(link.members)) for link in self.links), self.ground,
@@ -242,7 +256,8 @@ class Mechanism:
                 tuple(sorted(self.as_built.items())),
                 tuple((name, tuple(sorted(values.items()))) for name, values in sorted(self.configurations.items())),
                 tuple(self.warnings), tuple(motion.signature() for _name, motion in sorted(self.motions.items())),
-                tuple(coupling.signature() for _name, coupling in sorted(self.couplings.items())))
+                tuple(coupling.signature() for _name, coupling in sorted(self.couplings.items())),
+                tuple(self.rigid_edges))
 
 
 # --- matrices ------------------------------------------------------------------------------
@@ -819,29 +834,60 @@ def _extract(pair: Pair, relative: np.ndarray, hint: tuple | None, scale: float)
     return found
 
 
-def _by_label(jointed: list, used: set[int], tree: Any, warnings: list[str]) -> list[tuple]:
+def _by_label(jointed: list, used: set[int], tree: Any, warnings: list[str],
+              unfound: dict[tuple[tuple[int, ...], int], str] | None = None) -> list[tuple]:
     """The pairings of joints no ``connect_to`` joined, by their labels: a moving joint and a
     ``RigidJoint`` of the same label on another part are its pair (the moving joint's part stays,
     the rigid one's is placed on it), and two rigid joints of one label fasten their parts. Of
     several candidates, the nearest in the tree is taken (what a placement of a sub-assembly
     holds pairs within it); a moving joint with two equally near is no pair, and a warning,
     rigid joints with two equally near are no pair. A joint that matches nothing is no pair."""
+    unfound = {} if unfound is None else unfound
+    raw_names = {path: "/".join(_occurrence(tree, path)[1]) for path, _joint in jointed}
+    name_counts: dict[str, int] = {}
+    for path in raw_names:
+        raw = raw_names[path]
+        name_counts[raw] = name_counts.get(raw, 0) + 1
+
+    def part_name(path: tuple[int, ...]) -> str:
+        raw = raw_names.get(path) or "/".join(_occurrence(tree, path)[1])
+        return f"{raw}[{'.'.join(str(i) for i in path)}]" if name_counts.get(raw, 0) > 1 else raw
+
     rows: dict[str, list[tuple[tuple[int, ...], Any]]] = {}
     for path, joint in jointed:
-        if id(joint) not in used and _joint_kind(joint) is not None:
-            rows.setdefault(joint.label, []).append((path, joint))
+        if id(joint) in used:
+            continue
+        if _joint_kind(joint) is None:
+            missing = unfound.get((path, id(joint)))
+            if missing is not None:
+                warnings.append(f"joint {getattr(joint, 'label', joint)!r} ({type(joint).__name__}) on "
+                                f"{part_name(path)} is connected to {missing!r}, whose holder was not found in the "
+                                "assembly, and has an unsupported joint kind and cannot pair")
+            else:
+                warnings.append(f"joint {getattr(joint, 'label', joint)!r} ({type(joint).__name__}) on "
+                                f"{part_name(path)} has an unsupported joint kind and cannot pair")
+            continue
+        rows.setdefault(joint.label, []).append((path, joint))
     found = []
 
-    def nearest(path: tuple[int, ...], label: str, candidates: list, strict: bool = True) -> Any:
+    def nearest(path: tuple[int, ...], label: str, candidates: list, strict: bool = True,
+                joint: Any = None) -> Any:
         best = max(_common(path, other) for other, _joint in candidates)
         ties = [row for row in candidates if _common(path, row[0]) == best]
         if len(ties) > 1 and not strict:
             return None
         if len(ties) > 1:
             names = " and ".join("/".join(_occurrence(tree, other)[1]) for other, _joint in ties[:2])
-            warnings.append(f"joint {label!r} on {'/'.join(_occurrence(tree, path)[1])} matches the rigid joints "
-                            f"{label!r} on {names} alike, so it pairs with neither: give each pair a label of its "
-                            "own, or connect it with connect_to")
+            missing = None if joint is None else unfound.get((path, id(joint)))
+            if missing is not None:
+                warnings.append(f"joint {label!r} ({type(joint).__name__}) on {part_name(path)} is connected to "
+                                f"{missing!r}, whose holder was not found in the assembly, and matches the rigid "
+                                f"joints {label!r} on {names} alike, so it pairs with neither: give each pair a label "
+                                "of its own, or connect it with connect_to")
+            else:
+                warnings.append(f"joint {label!r} on {part_name(path)} matches the rigid joints "
+                                f"{label!r} on {names} alike, so it pairs with neither: give each pair a label of its "
+                                "own, or connect it with connect_to")
             return None
         return ties[0]
 
@@ -849,10 +895,29 @@ def _by_label(jointed: list, used: set[int], tree: Any, warnings: list[str]) -> 
         rigid = [row for row in held if _joint_kind(row[1]) == "rigid"]
         for path, joint in [row for row in held if _joint_kind(row[1]) != "rigid"]:
             candidates = [row for row in rigid if row[0] != path]
-            other = nearest(path, label, candidates) if candidates else None
+            missing = unfound.get((path, id(joint)))
+            if not candidates:
+                if missing is not None:
+                    warnings.append(f"joint {label!r} ({type(joint).__name__}) on {part_name(path)} is connected to "
+                                    f"{missing!r}, whose holder was not found in the assembly, and has no rigid "
+                                    f"candidate {label!r} on another part")
+                else:
+                    warnings.append(f"joint {label!r} ({type(joint).__name__}) on {part_name(path)} "
+                                    f"has no connection and no rigid candidate {label!r} on another part")
+                continue
+            other = nearest(path, label, candidates, joint=joint)
             if other is not None:
                 rigid.remove(other)
                 found.append((path, joint, other[0], other[1]))
+                if missing is not None:
+                    warnings.append(f"joint {label!r} ({type(joint).__name__}) on {part_name(path)} is connected to "
+                                    f"{missing!r}, whose holder was not found in the assembly; paired by label "
+                                    f"{label!r} with {part_name(other[0])}")
+                other_missing = unfound.get((other[0], id(other[1])))
+                if other_missing is not None:
+                    warnings.append(f"joint {label!r} ({type(other[1]).__name__}) on {part_name(other[0])} is "
+                                    f"connected to {other_missing!r}, whose holder was not found in the assembly; "
+                                    f"paired by label {label!r} with {part_name(path)}")
         # Rigid joints alone fasten only where one is nearest: a datum a part carries in each of
         # its placements (three pegs' `base`) is no fastening.
         mates = {}
@@ -860,9 +925,39 @@ def _by_label(jointed: list, used: set[int], tree: Any, warnings: list[str]) -> 
             candidates = [row for row in rigid if row[0] != path]
             other = nearest(path, label, candidates, strict=False) if candidates else None
             mates[at] = None if other is None else next(index for index, row in enumerate(rigid) if row is other)
+        paired_rigid: set[int] = set()
         for at, other in mates.items():
             if other is not None and other > at and mates.get(other) == at:  # each the other's one nearest
-                found.append((*rigid[at], *rigid[other]))
+                r1, r2 = rigid[at], rigid[other]
+                found.append((*r1, *r2))
+                paired_rigid.update((id(r1[1]), id(r2[1])))
+                for (r_path, r_joint), (mate_path, _mate_joint) in ((r1, r2), (r2, r1)):
+                    missing = unfound.get((r_path, id(r_joint)))
+                    if missing is not None:
+                        warnings.append(f"joint {label!r} ({type(r_joint).__name__}) on {part_name(r_path)} is "
+                                        f"connected to {missing!r}, whose holder was not found in the assembly; "
+                                        f"paired by label {label!r} with {part_name(mate_path)}")
+        for r_path, r_joint in rigid:
+            if id(r_joint) in paired_rigid:
+                continue
+            missing = unfound.get((r_path, id(r_joint)))
+            if missing is None:
+                continue
+            candidates = [row for row in rigid if row[0] != r_path]
+            ties = []
+            if candidates:
+                best = max(_common(r_path, other) for other, _joint in candidates)
+                ties = [row for row in candidates if _common(r_path, row[0]) == best]
+            if len(ties) > 1:
+                names = " and ".join("/".join(_occurrence(tree, other)[1]) for other, _joint in ties[:2])
+                warnings.append(f"joint {label!r} ({type(r_joint).__name__}) on {part_name(r_path)} is connected to "
+                                f"{missing!r}, whose holder was not found in the assembly, and matches the rigid "
+                                f"joints {label!r} on {names} alike, so it pairs with neither: give each pair a label "
+                                "of its own, or connect it with connect_to")
+            else:
+                warnings.append(f"joint {label!r} ({type(r_joint).__name__}) on {part_name(r_path)} is connected to "
+                                f"{missing!r}, whose holder was not found in the assembly, and has no rigid candidate "
+                                f"{label!r} on another part")
     return found
 
 
@@ -921,13 +1016,21 @@ def harvest(result: Any, tree: Any, root_path: tuple[int, ...]) -> Mechanism | N
         if held:
             coupled.append((path, obj, held))
 
+    def name_of(path: tuple[int, ...]) -> str:
+        return "/".join(_occurrence(tree, path)[1])
+
     # Every connect_to: (the joint called and its part, which stays; the other and its part, which moves).
     seen: set = set()
+    unfound: dict[tuple[tuple[int, ...], int], str] = {}
     pairings = []
+    warnings: list[str] = []
     for path, joint in jointed:
         other = getattr(joint, "connected_to", None)
-        candidates = holders.get(id(other)) if other is not None else None
+        if other is None:
+            continue
+        candidates = holders.get(id(other))
         if not candidates:
+            unfound[(path, id(joint))] = getattr(other, "label", None) or repr(other)
             continue
         moved = max(candidates, key=lambda candidate: _common(path, candidate))
         key = frozenset([(path, id(joint)), (moved, id(other))])
@@ -935,11 +1038,8 @@ def harvest(result: Any, tree: Any, root_path: tuple[int, ...]) -> Mechanism | N
             continue
         seen.add(key)
         pairings.append((path, joint, moved, other))
-    warnings: list[str] = []
-    pairings.extend(_by_label(jointed, {id(joint) for row in pairings for joint in (row[1], row[3])}, tree, warnings))
-
-    def name_of(path: tuple[int, ...]) -> str:
-        return "/".join(_occurrence(tree, path)[1])
+    used = {id(joint) for row in pairings for joint in (row[1], row[3])}
+    pairings.extend(_by_label(jointed, used, tree, warnings, unfound))
 
     def labels_below(path: tuple[int, ...]) -> set[str]:
         return {joint.label for holder, joint in jointed if holder[:len(path)] == path}
@@ -999,13 +1099,18 @@ def harvest(result: Any, tree: Any, root_path: tuple[int, ...]) -> Mechanism | N
         return path
 
     moving_pairs = []
+    rigid_edges: list[tuple[tuple[int, ...], tuple[int, ...], str]] = []
     for stays, joint, moves, other in pairings:
         kinds = (_joint_kind(joint), _joint_kind(other))
         find(stays), find(moves)
         if kinds == ("rigid", "rigid"):
             parent[find(moves)] = find(stays)
+            rigid_edges.append((stays, moves, joint.label))
             continue
         if None in kinds:
+            warnings.append(
+                f"joint {joint.label!r} ({type(joint).__name__}) on {name_of(stays)} is connected to "
+                f"{other.label!r} ({type(other).__name__}) on {name_of(moves)} with an unsupported joint kind")
             continue
         if "rigid" not in kinds:
             warnings.append(
@@ -1022,7 +1127,14 @@ def harvest(result: Any, tree: Any, root_path: tuple[int, ...]) -> Mechanism | N
         if configured or motioned or coupled:
             warnings.append("the mechanism states, couplings or configuration sequences name joints, and no moving "
                             "joint is paired")
-        return Mechanism(tree.root.name, [], 0, [], {}, {}, warnings) if warnings else None
+        if not warnings and not rigid_edges:
+            return None
+        classes: dict[tuple[int, ...], list[tuple[int, ...]]] = {}
+        for path in sorted({end for stays, moves, _label in rigid_edges for end in (stays, moves)}):
+            classes.setdefault(find(path), []).append(path)
+        links = [Link(_occurrence(tree, members[0])[1][-1], sorted(members))
+                 for _root, members in sorted(classes.items(), key=lambda item: item[1][0])]
+        return Mechanism(tree.root.name, links, 0, [], {}, {}, warnings, rigid_edges=rigid_edges)
 
     _enclose(parent, find, moving_pairs)
     classes: dict[tuple[int, ...], list[tuple[int, ...]]] = {}
@@ -1111,7 +1223,8 @@ def harvest(result: Any, tree: Any, root_path: tuple[int, ...]) -> Mechanism | N
                             "axis, axis.located(part.location)")
 
     couplings, controls = _couplings(coupled, pairs, joint_labels, name_of, warnings, as_built)
-    found = Mechanism(tree.root.name, links, 0, pairs, as_built, {}, warnings, couplings=couplings)
+    found = Mechanism(tree.root.name, links, 0, pairs, as_built, {}, warnings, couplings=couplings,
+                      rigid_edges=rigid_edges)
     found.configurations = _configurations(configured, found, joint_labels, controls, name_of)
     if motioned:
         functions = any(spec[0] == "function" for _path, _obj, held in motioned for spec in held.values())
@@ -1769,6 +1882,15 @@ def write(doc: Any, mechanism: Mechanism, occurrence: Callable[[tuple[int, ...]]
                 references = TDataStd_ReferenceList.Set_s(label)
                 for end in ends:
                     references.Append(pair_label[end])
+    if mechanism.rigid_edges:
+        rigids = _label(top, 7, "rigid_edges")
+        for at, (first, second, joint_name) in enumerate(mechanism.rigid_edges, 1):
+            edge = _label(rigids, at, joint_name)
+            for end_at, path in enumerate((first, second), 1):
+                entries = List_TCollection_AsciiString()
+                for step in occurrence(path):
+                    entries.Append(TCollection_AsciiString(_entry(step)))
+                XCAFDoc_AssemblyItemRef.Set_s(edge.FindChild(end_at, True), XCAFDoc_AssemblyItemId(entries))
 
 
 def _value_type(pair: Pair, index: int) -> str:
@@ -1993,7 +2115,26 @@ def read(doc: Any, occurrences: dict[str, tuple[int, ...]]) -> Mechanism | None:
         coupling = _read_couplers(_label_name(label), label, pair_at, pairs)
         if coupling is not None:
             couplings[coupling.name] = coupling
-    return Mechanism(_label_name(top), links, ground, pairs, as_built, configurations, [], motions, couplings)
+    warnings: list[str] = []
+    rigid_edges: list[tuple[tuple[int, ...], tuple[int, ...], str]] = []
+    held_rigids = top.FindChild(7, False)
+    for label in ([] if held_rigids.IsNull() or not held_rigids.HasAttribute() else _children_of(held_rigids)):
+        if not label.HasAttribute() and not any(child.HasAttribute() for child in _children_of(label)):
+            continue
+        joint_name = _label_name(label)
+        ends = []
+        for child in _children_of(label):
+            item = XCAFDoc_AssemblyItemRef()
+            if _find(child, item, XCAFDoc_AssemblyItemRef.GetID_s()):
+                ends.append(occurrences.get(item.GetItem().ToString().ToCString()))
+            elif child.HasAttribute():
+                ends.append(None)
+        if not joint_name or len(ends) != 2 or None in ends:
+            warnings.append(f"rigid edge {joint_name or _entry(label)!r} at {_entry(label)} is malformed and was refused")
+            continue
+        rigid_edges.append((ends[0], ends[1], joint_name))
+    return Mechanism(_label_name(top), links, ground, pairs, as_built, configurations, warnings, motions, couplings,
+                     rigid_edges)
 
 
 # --- what the page reads -------------------------------------------------------------------
@@ -2079,7 +2220,10 @@ def block(mechanism: Mechanism, instance_paths: list[tuple[int, ...]],
             "couplings": {name: _coupling_json(coupling, mechanism.pairs, mechanism.as_built)
                           for name, coupling in mechanism.couplings.items()},
             "motions": {name: _motion_json(motion) for name, motion in mechanism.motions.items()},
-            "loop": loop, "warnings": warnings}
+            "loop": loop, "warnings": warnings,
+            **({"rigid_edges": [[list(first), list(second), joint_name]
+                                for first, second, joint_name in mechanism.rigid_edges]}
+               if mechanism.rigid_edges else {})}
 
 
 def _motion_json(motion: Motion) -> dict[str, Any]:
