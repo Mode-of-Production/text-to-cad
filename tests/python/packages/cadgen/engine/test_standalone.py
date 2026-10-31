@@ -20,8 +20,8 @@ SRC = ENGINE.parent.parent
 # so no module drives a browser.
 LIBRARIES = {"OCP", "build123d", "bd_materials", "threejs_materials", "numpy", "PIL"}
 # By module, what one imports beyond those: ezdxf, build123d's own DXF library, which the DXF
-# export writes and checks a drawing with.
-BESIDES = {"export/dxf.py": {"ezdxf"}}
+# export writes and checks a drawing with; scipy, whose bounded least_squares closes kinematic loops.
+BESIDES = {"export/dxf.py": {"ezdxf"}, "mechanism.py": {"scipy"}}
 
 
 class StandaloneTest(unittest.TestCase):

@@ -65,9 +65,9 @@ built tree. The pairs make a mechanism in ISO 10303-105's terms, the kinematics 
 A link's frame is its first member occurrence's placement as built (the ground's, the
 world's when it has none). A pair the built tree contradicts -- its two joints on one rigid
 link, or its rigid joint's frame not one motion of the pair from its moving joint's -- is
-refused at document time, by name. A loop's pairs are kept and not posed (no solver), and a
-non-linear relation (a function coupling, a cam) is no part of the mechanism: a configuration
-sequence says it.
+refused at document time, by name. A loop's free pairs are solved from the as-built branch to
+close every closing pair within the tolerances, and a non-linear relation (a function coupling, a
+cam) is no part of the mechanism: a configuration sequence says it.
 
 **Configuration sequences** (``configuration_sequence(assembly, name, ...)``, AP242's
 ``interpolated_configuration_sequence``; the structure and the viewer call them motions) are
@@ -127,7 +127,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -1547,10 +1547,14 @@ def _motions(motioned: list, mechanism: Mechanism, joint_labels: list, controls:
     sampled, a coupling's value made its joints'), a shallower assembly's motion over a deeper
     one's of the same name. A motion naming a configuration the mechanism has not, or a joint
     its assembly has not, is the harvest's error; one setting a value its pair cannot take, or
-    moving a pair that closes a loop, is left out, and warned."""
+    moving a loop to a key where it cannot close, is left out, and warned."""
     pairs, warnings = mechanism.pairs, mechanism.warnings
+    blocked: dict[str, str] = {}
+    # A loop's motion is solved key by key, each key seeded by the one before, by a Timeline (the
+    # one path: resolve, LinkWorlds). Its pair values do not depend on the links' placements as
+    # built (every loop pair carries a value), so the links stand at the identity here.
     _reached, loop = _tree(mechanism)
-    blocked = {label: f"pairs {', '.join(loop)} close a loop" for label in loop or ()}
+    looped = block(mechanism, [], lambda _path: _column(np.eye(4))) if loop else None
     tolerances = {pair.label: [math.degrees(ANGULAR_TOLERANCE) if unit == "deg" else LINEAR_TOLERANCE * size
                                for unit, *_names in KINDS[pair.kind][1]] for pair in pairs}
     found: dict[str, Motion] = {}
@@ -1593,6 +1597,11 @@ def _motions(motioned: list, mechanism: Mechanism, joint_labels: list, controls:
                                   if label in blocked})
                 if stopped:
                     raise _Unfit(f"{where} moves joint {stopped[0]!r}, which cannot be posed: {blocked[stopped[0]]}")
+                if looped is not None:
+                    try:
+                        Timeline({**looped, "motions": {name: _motion_json(motion)}}, name)
+                    except KinematicsError as error:
+                        raise _Unfit(f"{where}: {error}") from None
             except _Unfit as error:
                 warnings.append(f"{error}: the configuration sequence is left out")
                 found.pop(name, None)
@@ -2160,8 +2169,11 @@ def _tree(mechanism: Mechanism) -> tuple[dict[int, int], list[str] | None]:
             used.add(at)
             other = pair.links[1] if pair.links[0] == link else pair.links[0]
             if other in reached:
+                found_loop = _loop(mechanism, via, link, other, at)
                 if loop is None:
-                    loop = _loop(mechanism, via, link, other, at)
+                    loop = found_loop
+                else:
+                    loop.extend(label for label in found_loop if label not in loop)
                 continue
             reached[other] = at
             via[other] = at
@@ -2210,9 +2222,6 @@ def block(mechanism: Mechanism, instance_paths: list[tuple[int, ...]],
               "matrix": world(link.members[0]) if link.members else _column(np.eye(4))}
              for at, link in enumerate(mechanism.links)]
     warnings = list(mechanism.warnings)
-    if loop:
-        warnings.append(f"pairs {', '.join(loop)} close a loop, which has no pose without a solver: posing them is "
-                        "refused")
     return {"schema": SCHEMA, "name": mechanism.name, "ground": mechanism.ground, "links": links, "pairs": pairs,
             "asBuilt": {label: _json_value(values) for label, values in mechanism.as_built.items()},
             "configurations": {name: {label: _json_value(values) for label, values in values_.items()}
@@ -2237,6 +2246,11 @@ def _motion_json(motion: Motion) -> dict[str, Any]:
 # --- motions over time -----------------------------------------------------------------------
 
 
+# A Timeline's seed step: the most any joint moves between a loop sample and the sample that seeds
+# it (the loop solver's own continuation step, LinkWorlds.solve).
+_SEED_STEP = (15.0, 30.0)  # degrees, then length units
+
+
 class Timeline:
     """A motion of the structure's ``kinematics`` over time: ``values(t)`` the pair values
     at ``t`` seconds of its clip, every pair the motion does not move as built. A clip is the
@@ -2254,16 +2268,24 @@ class Timeline:
         keys = entry["keys"]
         self.times = np.array([float(key["t"]) for key in keys])
         self.duration = self.period = float(self.times[-1])
+        as_built = {label: _as_tuple(value) for label, value in (kinematics.get("asBuilt") or {}).items()}
         configurations = kinematics.get("configurations") or {}
         moving: set[str] = set()
         poses = []
+        seed = as_built
         for key in keys:
             if "configuration" in key:
                 moving |= set(configurations[key["configuration"]])
-                poses.append(resolve(kinematics, key["configuration"])[0])
+                pose = resolve(kinematics, key["configuration"], seed=seed)[0]
             else:
                 moving |= set(key["values"])
-                poses.append(resolve(kinematics, key["values"], own=True)[0])
+                pose = resolve(kinematics, key["values"], own=True, seed=seed)[0]
+            poses.append(pose)
+            seed = pose
+        # A sample's loop seed is the motion's own previous sample in time (``_anchor``), so
+        # ``values(t)`` is a function of the timeline and ``t`` alone, whatever order t comes in.
+        self.key_poses = poses
+        self._grid: dict[int, list[dict[str, tuple[float, ...]]]] = {}
         self.labels = sorted(moving)
         self.sizes = [len(poses[0][label]) for label in self.labels]
         self.table = np.array([[value for label in self.labels for value in pose[label]] for pose in poses],
@@ -2272,6 +2294,12 @@ class Timeline:
         limits = [limit for label in self.labels for limit in (pairs[label].get("limits") or ())]
         self.lower = np.array([-math.inf if low is None else low for low, _high in limits], dtype=float)
         self.upper = np.array([math.inf if high is None else high for _low, high in limits], dtype=float)
+        # Each span between two keys is split into steps of at most _SEED_STEP of any of its joints.
+        units = [unit for label in self.labels
+                 for unit in (pairs[label].get("units") or [u for u, *_ in KINDS[pairs[label]["type"]][1]])]
+        scale = np.array([_SEED_STEP[0] if unit == "deg" else _SEED_STEP[1] for unit in units], dtype=float)
+        self.steps = [max(1, int(math.ceil(float(np.max(np.abs(after - before) / scale, initial=0.0)))))
+                      for before, after in zip(self.table[:-1], self.table[1:])]
 
     def joints(self, t: float) -> dict[str, tuple[float, ...]]:
         flat = np.clip(_interpolated(self.times, self.table, self.ease, t), self.lower, self.upper)
@@ -2282,7 +2310,25 @@ class Timeline:
         return found
 
     def values(self, t: float) -> dict[str, tuple[float, ...]]:
-        return resolve(self.kinematics, self.joints(t), own=True)[0]
+        seed = self._anchor(t) if self.kinematics.get("loop") else None
+        return resolve(self.kinematics, self.joints(t), own=True, seed=seed)[0]
+
+    def _anchor(self, t: float) -> dict[str, tuple[float, ...]]:
+        """The loop seed of the sample at ``t``: the motion's own sample at the step time at or
+        before ``t``. A span's step samples are solved in time order from the key that starts it,
+        each from the one before, so each is the same whichever ``t`` asked for it first."""
+        last = len(self.key_poses) - 1
+        span = min(max(int(np.searchsorted(self.times, t, side="right")) - 1, 0), last)
+        if span == last:
+            return self.key_poses[last]
+        count = self.steps[span]
+        width = (self.times[span + 1] - self.times[span]) / count
+        step = min(max(int((t - self.times[span]) // width), 0), count - 1)
+        grid = self._grid.setdefault(span, [self.key_poses[span]])
+        while len(grid) <= step:
+            at = self.times[span] + len(grid) * width
+            grid.append(resolve(self.kinematics, self.joints(at), own=True, seed=grid[-1])[0])
+        return grid[step]
 
     @property
     def breaks(self) -> list[float]:
@@ -2350,13 +2396,15 @@ def _example(limits: Any) -> float | int:
 
 
 def resolve(kinematics: dict[str, Any] | None, pose: Any, *,
-            own: bool = False) -> tuple[dict[str, tuple[float, ...]], str | None]:
+            own: bool = False,
+            seed: dict[str, tuple[float, ...]] | None = None) -> tuple[dict[str, tuple[float, ...]], str | None]:
     """The values a pose sets every pair to, and the configuration it names: ``pose`` is
     None (as built), a configuration's name, or ``{joint label or coupling name: value}``
     (the rest as built; a coupling at ``c`` puts each of its joints at its as-built values
     plus its ratio times ``c``). An unknown name or joint, a value out of range, a coupling's
     joint set alone and a coupling set with one of its joints are refused by name. ``own``: the
-    values are the document's own (a motion's keys), which set a coupling's joints."""
+    values are the document's own (a motion's keys), which set a coupling's joints; ``seed``:
+    the starting branch configuration for closing a kinematic loop (defaults to ``as_built``)."""
     if kinematics is None:
         if pose is None:
             return {}, None
@@ -2382,8 +2430,6 @@ def resolve(kinematics: dict[str, Any] | None, pose: Any, *,
 
     def unposable(label: str) -> str | None:
         """Why the pair cannot be posed, or None."""
-        if label in loop:
-            return f"pairs {', '.join(loop)} close a loop, which has no pose without a solver"
         return None
 
     controls = {}
@@ -2413,13 +2459,61 @@ def resolve(kinematics: dict[str, Any] | None, pose: Any, *,
                                       f"{why}")
     values.update(_coupled(controls, couplings, as_built,
                            lambda label, row, at: _block_checked(pairs[label], row, at), where))
+    # The pairs the caller drove, in the caller's order: a coupling stands for its joints.
+    driven = list(dict.fromkeys(label for name in given
+                                for label in ([term[0] for term in couplings[name]["terms"]]
+                                              if name in controls else [name])))
+    if loop and kinematics.get("links") and any(pair.get("frames") for pair in kinematics["pairs"]) and driven:
+        values = LinkWorlds(kinematics).solve(values, fixed=driven, where=where, seed=seed)[0]
     return values, named
+
+
+def _rotvec(rot: np.ndarray) -> np.ndarray:
+    """The axis-angle vector (radians) of a 3x3 rotation matrix."""
+    w = 0.5 * np.array([rot[2, 1] - rot[1, 2], rot[0, 2] - rot[2, 0], rot[1, 0] - rot[0, 1]])
+    s = float(np.linalg.norm(w))
+    c = max(-1.0, min(1.0, 0.5 * (float(np.trace(rot)) - 1.0)))
+    if s > 1e-7:
+        return w * (math.atan2(s, c) / s)
+    if c >= 0.0:
+        return w * (1.0 + s * s / 6.0)
+    plus = rot + np.eye(3)
+    col = int(np.argmax(np.linalg.norm(plus, axis=0)))
+    axis = plus[:, col] / np.linalg.norm(plus[:, col])
+    return axis * math.pi
+
+
+def _solve_step(residual_fn: Callable[[np.ndarray], np.ndarray], q0: np.ndarray,
+                lower: np.ndarray, upper: np.ndarray, tol: float, max_nfev: int) -> np.ndarray:
+    """One bounded trust-region-reflective least-squares solve for a continuation step."""
+    from scipy.optimize import least_squares
+
+    q_init = np.clip(q0, lower, upper)
+    if float(np.max(np.abs(residual_fn(q_init)))) <= tol:
+        return q_init
+    for idx in range(q_init.size):
+        span = upper[idx] - lower[idx]
+        nudge = 1e-5 if not math.isfinite(span) else min(1e-5, 0.1 * span)
+        if math.isfinite(lower[idx]) and q_init[idx] <= lower[idx] + nudge:
+            q_init[idx] = lower[idx] + nudge
+        elif math.isfinite(upper[idx]) and q_init[idx] >= upper[idx] - nudge:
+            q_init[idx] = upper[idx] - nudge
+    res = least_squares(
+        residual_fn,
+        q_init,
+        bounds=(lower, upper),
+        method="trf",
+        ftol=tol,
+        xtol=tol,
+        gtol=tol,
+        max_nfev=max_nfev,
+    )
+    return np.asarray(res.x, dtype=float)
 
 
 def link_worlds(kinematics: dict[str, Any], values: dict[str, tuple[float, ...]]) -> list[np.ndarray]:
     """Each link's placement at ``values``: the ground where it is, every other link by its
-    pairs from the ground down (a pair that closes a loop is not followed; a pair with no value
-    holds its links as built)."""
+    pairs from the ground down (free loop pairs solved to close every closing pair)."""
     return LinkWorlds(kinematics)(values)
 
 
@@ -2429,11 +2523,13 @@ class LinkWorlds:
     is each pair's motion and the products along the chain, the same arithmetic in the same order."""
 
     def __init__(self, kinematics: dict[str, Any]) -> None:
-        links = kinematics["links"]
+        links = kinematics.get("links") or ()
         self.count = len(links)
-        self.ground = kinematics.get("ground")
+        self.ground = kinematics.get("ground", 0)
         self.built = [_from_column(link["matrix"]) for link in links]
-        self.pairs = [pair for pair in kinematics["pairs"] if pair.get("frames")]
+        self.pairs = [pair for pair in kinematics.get("pairs") or () if pair.get("frames")]
+        self.as_built = {label: _as_tuple(value) for label, value in (kinematics.get("asBuilt") or {}).items()}
+        self.loop = list(kinematics.get("loop") or ())
         self.eye = np.eye(4)
         # Per pair: its frames (item_1, item_2) and their inverses, with a value and without one
         # (the two links as they stand: the second's placement as built over the first's).
@@ -2446,6 +2542,51 @@ class LinkWorlds:
             item_1, item_2 = np.linalg.inv(self.built[first]), np.linalg.inv(self.built[second])
             self.held.append((item_1, np.linalg.inv(item_2), item_2, np.linalg.inv(item_1)))
         self.orders: dict[frozenset, list[tuple[int, bool, bool]]] = {}
+        self.closers, self.cycles = self._find_loops()
+
+    def _find_loops(self) -> tuple[list[int], list[str]]:
+        if not self.count or not self.pairs:
+            return [], []
+        reached = {self.ground}
+        via: dict[int, int | None] = {self.ground: None}
+        queue = [self.ground]
+        used: set[int] = set()
+        closers: list[int] = []
+        cycles: list[str] = []
+
+        def chain(link: int) -> list[int]:
+            found = []
+            while via.get(link) is not None:
+                edge = via[link]
+                assert edge is not None
+                found.append(edge)
+                a, b = self.pairs[edge]["links"]
+                link = a if b == link else b
+            return found
+
+        while queue:
+            link = queue.pop(0)
+            for at, pair in enumerate(self.pairs):
+                first, second = pair["links"]
+                if at in used or link not in (first, second) or first == second:
+                    continue
+                used.add(at)
+                other = second if first == link else first
+                if other in reached:
+                    closers.append(at)
+                    left, right = chain(link), chain(other)
+                    while left and right and left[-1] == right[-1]:
+                        left.pop()
+                        right.pop()
+                    for idx in (*left, at, *reversed(right)):
+                        label = self.pairs[idx]["label"]
+                        if label not in cycles:
+                            cycles.append(label)
+                    continue
+                reached.add(other)
+                via[other] = at
+                queue.append(other)
+        return closers, cycles
 
     def _order(self, valued: frozenset) -> list[tuple[int, bool, bool]]:
         """The pairs in the order ``link_worlds`` follows them, given which carry a value: each
@@ -2471,7 +2612,7 @@ class LinkWorlds:
                 progress = True
         return steps
 
-    def __call__(self, values: dict[str, tuple[float, ...]]) -> list[np.ndarray]:
+    def _place(self, values: dict[str, tuple[float, ...]]) -> list[np.ndarray]:
         if not self.count:
             return []
         valued = frozenset(pair["label"] for pair in self.pairs if pair["label"] in values)
@@ -2490,6 +2631,276 @@ class LinkWorlds:
             else:
                 found[first] = found[second] @ item_2 @ np.linalg.inv(moved) @ unitem_1
         return [matrix if matrix is not None else self.built[at].copy() for at, matrix in enumerate(found)]
+
+    def _residuals(self, values: dict[str, tuple[float, ...]]) -> tuple[np.ndarray, list[np.ndarray], float, float]:
+        worlds = self._place(values)
+        rows = []
+        max_pos = 0.0
+        max_ang = 0.0
+        for at in self.closers:
+            pair = self.pairs[at]
+            first, second = pair["links"]
+            label = pair["label"]
+            if label in values:
+                item_1, _unitem_2, item_2, _unitem_1 = self.posed[at]
+                moved = pair_motion(pair["type"], values[label])
+            else:
+                item_1, _unitem_2, item_2, _unitem_1 = self.held[at]
+                moved = self.eye
+            f1 = worlds[first] @ item_1 @ moved
+            f2 = worlds[second] @ item_2
+            dp = f1[:3, 3] - f2[:3, 3]
+            dr = _rotvec(f2[:3, :3].T @ f1[:3, :3])
+            max_pos = max(max_pos, float(np.linalg.norm(dp)))
+            max_ang = max(max_ang, float(np.linalg.norm(dr)))
+            rows.append(dp / LINEAR_TOLERANCE)
+            rows.append(dr / ANGULAR_TOLERANCE)
+        return np.concatenate(rows), worlds, max_pos, max_ang
+
+    def solve(self, values: dict[str, tuple[float, ...]], fixed: Iterable[str] | None = None,
+              where: str = "the pose",
+              seed: dict[str, tuple[float, ...]] | None = None) -> tuple[dict[str, tuple[float, ...]], list[np.ndarray]]:
+        if not self.closers:
+            return dict(values), self._place(values)
+        seed_state = self.as_built if seed is None else {**self.as_built, **seed}
+        full = {**seed_state, **values}
+        if fixed is None:
+            _r0, worlds0, pos0, ang0 = self._residuals(full)
+            if all(label in values for label in self.cycles) and pos0 <= 1e-7 and ang0 <= 1e-7:
+                return full, worlds0
+            changed = [label for label in self.cycles if label in values
+                       and not np.allclose(values[label], seed_state.get(label, ()), rtol=0, atol=1e-12)]
+            missing = [label for label in self.cycles if label not in values]
+            if changed:
+                fixed = changed
+            elif missing:
+                fixed = [label for label in self.cycles if label in values]
+            else:
+                fixed = []
+        # ``fixed`` in the caller's order (the drive named first leads); the set for membership.
+        order = list(dict.fromkeys(fixed))
+        fixed = set(order)
+
+        free_labels = [label for label in self.cycles if label not in fixed]
+        by_label = {pair["label"]: pair for pair in self.pairs}
+        if len(fixed & set(self.cycles)) > 1 and free_labels:
+            all_dofs = sum(len(self.as_built[label]) for label in self.cycles)
+            r_seed0 = self._residuals(seed_state)[0]
+            j_all = np.empty((r_seed0.size, all_dofs), dtype=float)
+            col_at = 0
+            for label in self.cycles:
+                for dof_idx in range(len(self.as_built[label])):
+                    sp = dict(seed_state)
+                    row = list(sp[label])
+                    row[dof_idx] += 1e-6
+                    sp[label] = tuple(row)
+                    j_all[:, col_at] = (self._residuals(sp)[0] - r_seed0) / 1e-6
+                    col_at += 1
+            rank_all = int(np.sum(np.linalg.svd(j_all, compute_uv=False) > 1e-5))
+            mobility = max(1, all_dofs - rank_all)
+            free_dofs = sum(len(self.as_built[label]) for label in free_labels)
+            if free_dofs < rank_all:
+                # Over-specified: a primary drive (as many fixed dofs as the loop's mobility) is
+                # solved from the seed, and the pose is accepted when every other fixed value agrees
+                # there. Each fixed pair leads the primary in turn, the caller's order first, so a
+                # consistent pose is accepted whichever of its values the cycle order lists first.
+                ordered_fixed = [label for label in order if label in self.cycles]
+                tried: set[tuple[str, ...]] = set()
+                for start in range(len(ordered_fixed)):
+                    primary: list[str] = []
+                    used_dofs = 0
+                    for label in ordered_fixed[start:] + ordered_fixed[:start]:
+                        if used_dofs < mobility:
+                            primary.append(label)
+                            used_dofs += len(self.as_built[label])
+                    if tuple(sorted(primary)) in tried:
+                        continue
+                    tried.add(tuple(sorted(primary)))
+                    try:
+                        branch_full, _ = self.solve({label: full[label] for label in primary}, fixed=primary,
+                                                    where=where, seed=seed_state)
+                    except KinematicsError:
+                        continue  # this primary cannot reach its value from the seed: the next may
+                    for label in fixed:
+                        branch_full[label] = full[label]
+                    _r, worlds, max_pos, max_ang = self._residuals(branch_full)
+                    if max_pos <= LINEAR_TOLERANCE and max_ang <= ANGULAR_TOLERANCE:
+                        return branch_full, worlds
+                loop_names = ", ".join(self.loop or self.cycles)
+                shown = ", ".join(f"{label}={_shown(values[label])}" for label in sorted(fixed) if label in values) or "the given values"
+                raise KinematicsError(f"{where}: pairs {loop_names} close a loop and cannot assemble at {shown}")
+        if not free_labels:
+            _r, worlds, max_pos, max_ang = self._residuals(full)
+        else:
+            sizes = [len(self.as_built[label]) for label in free_labels]
+            limits = [limit for label in free_labels
+                      for limit in (by_label[label].get("limits") or [[None, None]] * len(self.as_built[label]))]
+            units = [unit for label in free_labels
+                     for unit in (by_label[label].get("units") or [u for u, *_ in KINDS[by_label[label]["type"]][1]])]
+            lower = np.array([-math.inf if low is None else float(low) for low, _high in limits], dtype=float)
+            upper = np.array([math.inf if high is None else float(high) for _low, high in limits], dtype=float)
+            scales = np.array([45.0 if unit == "deg" else 90.0 for unit in units], dtype=float)
+            full_circle = np.array(
+                [unit == "deg" and math.isfinite(low) and math.isfinite(high) and (high - low) >= 360.0 - 1e-9
+                 for unit, low, high in zip(units, lower, upper)],
+                dtype=bool,
+            )
+            ls_lower = np.where(full_circle, -math.inf, lower)
+            ls_upper = np.where(full_circle, math.inf, upper)
+
+            def wrap_q(q_vec: np.ndarray) -> np.ndarray:
+                out = q_vec.copy()
+                for idx in range(out.size):
+                    if full_circle[idx]:
+                        val = lower[idx] + ((out[idx] - lower[idx]) % 360.0)
+                        if abs(val - lower[idx]) < 1e-9 and abs(out[idx] - upper[idx]) < abs(out[idx] - lower[idx]):
+                            val = upper[idx]
+                        out[idx] = val
+                return np.clip(out, lower, upper)
+
+            def unpack(q_vec: np.ndarray, base: dict[str, tuple[float, ...]]) -> dict[str, tuple[float, ...]]:
+                trial = dict(base)
+                offset = 0
+                for label, size in zip(free_labels, sizes):
+                    trial[label] = tuple(float(v) for v in q_vec[offset:offset + size])
+                    offset += size
+                return trial
+
+            def interp_base(s_val: float) -> dict[str, tuple[float, ...]]:
+                if s_val >= 1.0:
+                    return dict(full)
+                step_base = dict(full)
+                for label in self.cycles:
+                    if label in fixed and label in seed_state:
+                        step_base[label] = tuple((1.0 - s_val) * a + s_val * b
+                                                 for a, b in zip(seed_state[label], full[label]))
+                return step_base
+
+            def jac_at(q_vec: np.ndarray, base_dict: dict[str, tuple[float, ...]]) -> np.ndarray:
+                r0 = self._residuals(unpack(q_vec, base_dict))[0]
+                jac = np.empty((r0.size, q_vec.size), dtype=float)
+                h = 1e-6
+                for col in range(q_vec.size):
+                    step_h = -h if (not full_circle[col] and q_vec[col] + h > upper[col] and q_vec[col] - h >= lower[col]) else h
+                    qp = q_vec.copy()
+                    qp[col] += step_h
+                    jac[:, col] = (self._residuals(unpack(qp, base_dict))[0] - r0) / step_h
+                return jac
+
+            if not (fixed & set(self.cycles)):
+                _r, worlds, max_pos, max_ang = self._residuals(full)
+            else:
+                max_jump = 0.0
+                for label in self.cycles:
+                    if label in fixed and label in seed_state:
+                        pair_units = by_label[label].get("units") or [u for u, *_ in KINDS[by_label[label]["type"]][1]]
+                        for a, b, u in zip(seed_state[label], full[label], pair_units):
+                            max_jump = max(max_jump, abs(b - a) / (15.0 if u == "deg" else 30.0))
+
+                q_curr = wrap_q(np.array([val for label in free_labels for val in seed_state[label]], dtype=float))
+                base0 = interp_base(0.0)
+                j_seed = jac_at(q_curr, base0)
+                u0, _s0, _ = np.linalg.svd(j_seed, full_matrices=False)
+                det_seed = float(np.linalg.det(u0.T @ j_seed))
+
+                def tan_at(q_vec: np.ndarray, j_mat: np.ndarray, s_val: float) -> np.ndarray | None:
+                    if max_jump <= 1e-12:
+                        return np.zeros(q_vec.size, dtype=float)
+                    eps_s = 1e-6
+                    base_here = interp_base(s_val)
+                    r0 = self._residuals(unpack(q_vec, base_here))[0]
+                    base_plus = dict(base_here)
+                    for label in self.cycles:
+                        if label in fixed and label in seed_state:
+                            base_plus[label] = tuple((1.0 - (s_val + eps_s)) * a + (s_val + eps_s) * b
+                                                     for a, b in zip(seed_state[label], full[label]))
+                    r_s = (self._residuals(unpack(q_vec, base_plus))[0] - r0) / eps_s
+                    try:
+                        v = np.linalg.solve(u0.T @ j_mat, -(u0.T @ r_s))
+                    except np.linalg.LinAlgError:
+                        return None
+                    v_norm = float(np.linalg.norm(v))
+                    return np.zeros_like(v) if v_norm <= 1e-12 else v / v_norm
+
+                u_curr = tan_at(q_curr, j_seed, 0.0)
+                if abs(det_seed) <= 1e-6 or u_curr is None:
+                    max_pos = max_ang = math.inf
+                    worlds = self._place(full)
+                else:
+                    n_init = max(1, min(32, int(math.ceil(max_jump))))
+                    ds = 1.0 / n_init
+                    ds_min = 1.0 / 2048.0
+                    s_curr = 0.0
+                    failed = False
+                    while s_curr < 1.0 - 1e-12:
+                        step = min(ds, 1.0 - s_curr)
+                        s_next = 1.0 if s_curr + step >= 1.0 - 1e-12 else s_curr + step
+                        base_next = interp_base(s_next)
+                        tol = 1e-11 if s_next >= 1.0 - 1e-12 else 1e-9
+                        max_nfev = 80 if s_next >= 1.0 - 1e-12 else 30
+                        q_raw = _solve_step(
+                            lambda q_arg, b=base_next: self._residuals(unpack(q_arg, b))[0],
+                            q_curr,
+                            ls_lower,
+                            ls_upper,
+                            tol,
+                            max_nfev,
+                        )
+                        q_next = wrap_q(q_raw)
+                        trial_next = unpack(q_next, base_next)
+                        _r, worlds_next, pos_next, ang_next = self._residuals(trial_next)
+                        step_ok = pos_next <= LINEAR_TOLERANCE and ang_next <= ANGULAR_TOLERANCE
+                        det_next = 0.0
+                        u_next = None
+                        if step_ok:
+                            dq = np.abs(q_next - q_curr)
+                            for idx in range(dq.size):
+                                if full_circle[idx]:
+                                    dq[idx] = abs((q_next[idx] - q_curr[idx] + 180.0) % 360.0 - 180.0)
+                            drive_span = max(step * max(1.0, max_jump), step)
+                            bound = scales * max(1.5 * drive_span, 0.5 * math.sqrt(drive_span))
+                            if np.any(dq > bound):
+                                step_ok = False
+                            else:
+                                j_next = jac_at(q_next, base_next)
+                                det_next = float(np.linalg.det(u0.T @ j_next))
+                                u_next = tan_at(q_next, j_next, s_next)
+                                if (det_next / det_seed <= 2e-4
+                                        or u_next is None
+                                        or float(np.max(np.abs(u_next - u_curr))) > max(0.35, 1.2 * drive_span)):
+                                    step_ok = False
+                        if step_ok:
+                            s_curr = s_next
+                            q_curr = q_next
+                            assert u_next is not None
+                            u_curr = u_next
+                            if ds < 1.0 / n_init:
+                                ds = min(1.0 / n_init, ds * 1.5)
+                        else:
+                            ds = step * 0.5
+                            if ds < ds_min:
+                                failed = True
+                                break
+                    if failed:
+                        max_pos = max_ang = math.inf
+                        worlds = self._place(full)
+                    else:
+                        full = unpack(q_curr, full)
+                        _r, worlds, max_pos, max_ang = self._residuals(full)
+                        j_final = jac_at(q_curr, full)
+                        if float(np.linalg.det(u0.T @ j_final)) / det_seed <= 2e-4:
+                            max_pos = max_ang = math.inf
+
+        if max_pos > LINEAR_TOLERANCE or max_ang > ANGULAR_TOLERANCE:
+            loop_names = ", ".join(self.loop or self.cycles)
+            shown = ", ".join(f"{label}={_shown(values[label])}" for label in sorted(fixed) if label in values) or "the given values"
+            raise KinematicsError(f"{where}: pairs {loop_names} close a loop and cannot assemble at {shown}")
+        return full, worlds
+
+    def __call__(self, values: dict[str, tuple[float, ...]]) -> list[np.ndarray]:
+        if not self.closers:
+            return self._place(values)
+        return self.solve(values)[1]
 
 
 def posed_instances(structure: dict[str, Any], values: dict[str, tuple[float, ...]]) -> list[list[float]]:

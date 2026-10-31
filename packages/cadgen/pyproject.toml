@@ -22,8 +22,8 @@ classifiers = [
   "Topic :: Multimedia :: Graphics :: 3D Modeling",
   "Topic :: Scientific/Engineering",
 ]
-# ezdxf and shapely both look transitive through build123d, and both are kept
-# DIRECT on purpose: cadgen imports each one itself, so each is its own
+# ezdxf, scipy and shapely all look transitive through build123d, and all three
+# are kept DIRECT on purpose: cadgen imports each one itself, so each is its own
 # dependency regardless of who else happens to pull it in.
 #
 # ezdxf is not an author-facing contract: the engine writes a DXF through
@@ -68,6 +68,11 @@ dependencies = [
   # The engine's stills rasterise what they draw over the picture (annotation ink,
   # measurements) with Pillow.
   "pillow",
+  # Closed-loop mechanism posing (engine/mechanism.py) solves each continuation
+  # step's loop-closure residual with scipy.optimize.least_squares (trust-region
+  # reflective with joint-limit bounds). build123d pulls scipy in transitively,
+  # and cadgen declares it directly because mechanism.py imports it itself.
+  "scipy",
   "shapely",
 ]
 
