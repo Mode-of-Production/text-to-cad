@@ -72,7 +72,8 @@ def tree_of(view: Any) -> Any:
                 {int(ordinal): tuple(rgba) for ordinal, rgba in (prototype.get("faceColors") or {}).items()},
                 key, _names(prototype), material=_material(prototype.get("material")),
                 face_materials={int(ordinal): _material(given)
-                                for ordinal, given in (prototype.get("faceMaterials") or {}).items() if given})
+                                for ordinal, given in (prototype.get("faceMaterials") or {}).items() if given},
+                attributes=tuple(sorted((prototype.get("attributes") or {}).items())))  # MoP fork (P1)
             order.append(found)
         return found
 
