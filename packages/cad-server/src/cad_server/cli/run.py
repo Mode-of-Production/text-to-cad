@@ -30,7 +30,7 @@ from pathlib import Path
 PROG = "cad run"
 # The library's runner of a program: ``python ARGS``, the program's folder last on its module search path.
 PROGRAM = "cad._internal.program"
-USAGE = "usage: cad run [--with REQ]... SCRIPT.py [ARGS...] | -m MODULE [ARGS...] | -c CODE\n"
+USAGE = "usage: cad run [--json] [--with REQ]... SCRIPT.py [ARGS...] | -m MODULE [ARGS...] | -c CODE\n"
 
 
 def requirements(given: list[str], rest: list[str]) -> tuple[list[str], list[str], str | None, list[str]]:
@@ -66,6 +66,10 @@ def main(argv: list[str] | None = None) -> int:
                                  "`# /// script` header (its dependencies), or with --with REQ: the environment is "
                                  "then the one of those packages beside it, made once.\n")
         return 0
+    if args[:1] == ["--json"]:
+        # MoP fork (P2): each model's report as one JSON line, for a pool that reads it (``model.Model``).
+        args = args[1:]
+        os.environ["CAD_REPORT_JSON"] = "1"
     from cad_server._internal import base, extras
 
     def said(line: str) -> None:
