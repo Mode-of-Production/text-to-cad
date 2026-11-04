@@ -257,7 +257,7 @@ class Model:
         finally:
             _CONTEXT.program = previous
         if program:
-            reported(built.models, built.wall, built.fresh, False)
+            reported(built.models, built.wall, built.fresh, bool(os.environ.get("CAD_REPORT_JSON")))  # MoP fork (P2)
         # Once a run, after its report: the server is another release than this library, under one contract.
         api.say_notice()
         if not built.ok:

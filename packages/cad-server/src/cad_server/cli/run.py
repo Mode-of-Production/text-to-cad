@@ -425,6 +425,10 @@ def main(argv: list[str] | None = None) -> int:
                                  "headless. The environment is made once, by the device's engine, and used again. "
                                  "uv run's options are taken as uv takes them.\n")
         return 0
+    if args[:1] == ["--json"]:
+        # MoP fork (P2): each model's report as one JSON line, for a pool that reads it (``model.Model``).
+        args = args[1:]
+        os.environ["CAD_REPORT_JSON"] = "1"
     from cad_server._internal import base, extras
 
     def said(line: str) -> None:
