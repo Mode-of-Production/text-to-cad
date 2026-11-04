@@ -62,6 +62,9 @@ build123d = [
   # PDF, so neither is optional. It runs in model code, where the server cannot know before the run
   # that a script wants it: so it is the kernel's.
   "matplotlib",
+  # MoP fork (P3): closed-loop mechanism posing (engine/mechanism.py) solves each step's loop-closure
+  # residual with scipy.optimize.least_squares. build123d pulls scipy in; the library imports it itself.
+  "scipy",
   "shapely",
   # The engine's DXF export writes a drawing through build123d's ExportDXF and checks it with ezdxf,
   # and @eng_drawing lays out its sheets in it; the OCCT stills draw their annotation ink and
