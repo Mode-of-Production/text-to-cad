@@ -102,10 +102,10 @@ DESCRIPTIONS = {
 def catalog():
     return [{"name": name, "title": name.removeprefix("cad_").capitalize() + " CAD",
              "description": description + " " + takes(name) + " A start returns an asynchronous operation (waitMs waits for its result): call this same tool with action=status, operationId and epoch (optionally afterSequence and waitMs) for progress/result, or action=cancel while queued. Disconnect does not cancel. Status of this MCP session's 64 most recent finished operations lasts up to 24 hours; restart loses it. Running file writes cannot be cancelled.",
-             "inputSchema": {**obj({**COMMON, **START[name]["properties"]}), "anyOf": [
-                 obj({"action": {"type": "string", "enum": ["start"]}, **_start(name)}, ("requestId", *START[name]["required"])),
-                 obj({**{k: COMMON[k] for k in FOLLOW}, "action": {"type": "string", "enum": ["status", "cancel"]}},
-                     FOLLOW_REQUIRED)]},
+             # MoP fork: one flat object. Claude Code and the Messages API refuse a top-level anyOf/oneOf/allOf. The
+             # start/follow union lives in the description (takes) and in check_arguments, which refuses a call before
+             # it is queued.
+             "inputSchema": obj({**COMMON, **START[name]["properties"]}),
              "outputSchema": {"type": "object", "required": ["state"], "properties": {
                  "state": {"type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled", "rejected"]},
                  "id": STRING, "epoch": STRING, "requestId": STRING, "operation": STRING,

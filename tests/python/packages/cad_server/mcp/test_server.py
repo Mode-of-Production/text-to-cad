@@ -25,7 +25,7 @@ from cad_mcp.shim import initialize_params
 from cad_server.mcp.protocol import RequestContext, RpcError
 from cad_server.viewer.recents import RecentStore
 from cad_server.mcp.server import _AGENT_TOOLS, FOLLOWS, Server, local_path
-from cad_server.mcp.operations import START, STARTS, check_arguments
+from cad_server.mcp.operations import FOLLOW, START, STARTS, _start, check_arguments
 from cad_server.mcp.tunnel import MAX_REPLY_BYTES
 from cad_server.mcp.ui import AppPage
 
@@ -1268,22 +1268,20 @@ class ToolArgumentsTest(unittest.TestCase):
             for tool in server.handle("tools/list", {}, None)["tools"]:
                 name, schema = tool["name"], tool["inputSchema"]
                 if name in START:
-                    branches = schema["anyOf"]
-                    self.assertEqual(set(schema["properties"]), {key for branch in branches for key in branch["properties"]}, name)
-                    # An agent reads the whole list: all but what names an operation to follow is a start's too.
-                    [start] = [branch for branch in branches if "start" in branch["properties"]["action"]["enum"]]
-                    self.assertEqual(set(schema["properties"]) - set(start["properties"]), {"operationId", "epoch", "afterSequence"}, name)
-                    for branch in branches:
-                        for key, property_schema in branch["properties"].items():
-                            if "start" in branch["properties"]["action"]["enum"]:
-                                # The set of arguments that names this one, else the first: what a start needs beside it.
-                                group = next((group for group in STARTS[name] if key in group), STARTS[name][0])
-                                base = {need: self.sample(need, branch["properties"][need]) for need in ("requestId", *group)}
-                            else:
-                                base = {"action": "status", "operationId": "operation", "epoch": "epoch"}
-                            arguments = {**base, key: self.sample(key, property_schema)}
-                            with self.subTest(catalog=catalog, tool=name, argument=key):
-                                check_arguments(name, arguments)  # raises where the handler refuses one
+                    # MoP fork: one flat object (a top-level anyOf is refused by Claude Code and the Messages API).
+                    self.assertNotIn("anyOf", schema, name)
+                    self.assertNotIn("oneOf", schema, name)
+                    self.assertEqual(schema["type"], "object", name)
+                    for key, property_schema in schema["properties"].items():
+                        # What a start needs beside the key: the set that names it, else the first.
+                        if key in FOLLOW and key != "action" and key not in _start(name):
+                            base = {"action": "status", "operationId": "operation", "epoch": "epoch"}
+                        else:
+                            group = next((group for group in STARTS[name] if key in group), STARTS[name][0])
+                            base = {need: self.sample(need, schema["properties"][need]) for need in ("requestId", *group)}
+                        arguments = {**base, key: self.sample(key, property_schema)}
+                        with self.subTest(catalog=catalog, tool=name, argument=key):
+                            check_arguments(name, arguments)  # raises where the handler refuses one
                 elif name in _AGENT_TOOLS:
                     base = {need: self.sample(need, schema["properties"][need]) for need in schema.get("required", [])}
                     for key, property_schema in schema["properties"].items():
