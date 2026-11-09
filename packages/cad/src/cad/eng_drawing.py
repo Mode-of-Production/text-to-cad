@@ -63,13 +63,19 @@ from typing import Any, Callable, Iterable, Sequence
 
 __all__ = ["eng_drawing", "Sheet", "View", "SHEET_SIZES"]
 
-#: ISO 216 sheet sizes, landscape, in millimetres.
+#: ISO 216 A sizes plus US Letter and Tabloid, landscape, and portrait keys, in millimetres. (MoP fork)
 SHEET_SIZES = {
     "A4": (297.0, 210.0),
     "A3": (420.0, 297.0),
     "A2": (594.0, 420.0),
     "A1": (841.0, 594.0),
     "A0": (1189.0, 841.0),
+    "LETTER": (279.4, 215.9),
+    "TABLOID": (431.8, 279.4),
+    "LETTER_PORTRAIT": (215.9, 279.4),
+    "TABLOID_PORTRAIT": (279.4, 431.8),
+    "A4_PORTRAIT": (210.0, 297.0),
+    "A3_PORTRAIT": (297.0, 420.0),
 }
 
 #: Standard view names -> (view direction: where the viewer STANDS relative to the
