@@ -43,7 +43,7 @@ from pathlib import Path
 PROG = "cad run"
 # The library's runner of a program: ``python ARGS``, the program's folder last on its module search path.
 PROGRAM = "cad._internal.program"
-USAGE = ("usage: cad run [uv run's options] SCRIPT.py [ARGS...] | -m MODULE [ARGS...] | -c CODE [ARGS...]"
+USAGE = ("usage: cad run [--json] [uv run's options] SCRIPT.py [ARGS...] | -m MODULE [ARGS...] | -c CODE [ARGS...]"
          " | COMMAND [ARGS...]\n")
 # uv run's options that take a value (uv 0.13's ``uv run --help``): the rest are flags. One uv adds later that
 # takes one is given as ``--option=value``.
@@ -108,6 +108,7 @@ class Plan:
     lock_mode: list[str] = field(default_factory=list)  # ``--locked``, ``--frozen``
     project_options: list[tuple[str, str | None]] = field(default_factory=list)  # its groups and the rest
     env_file: list[str] = field(default_factory=list)
+    json: bool = False
 
 
 def parse(argv: list[str]) -> Plan:
@@ -214,6 +215,10 @@ def _option(plan: Plan, name: str, value: str | None) -> None:
         plan.project_options.append((name, value))
     elif name == "--env-file":
         plan.env_file.append(value or "")
+    elif name == "--json":
+        if value is not None:
+            raise Usage("--json takes no value")
+        plan.json = True
     elif name in NO_OPS:
         pass
     elif name in TRANSIENT:
@@ -425,10 +430,6 @@ def main(argv: list[str] | None = None) -> int:
                                  "headless. The environment is made once, by the device's engine, and used again. "
                                  "uv run's options are taken as uv takes them.\n")
         return 0
-    if args[:1] == ["--json"]:
-        # MoP fork (P2): each model's report as one JSON line, for a pool that reads it (``model.Model``).
-        args = args[1:]
-        os.environ["CAD_REPORT_JSON"] = "1"
     from cad_server._internal import base, extras
 
     def said(line: str) -> None:
@@ -452,6 +453,9 @@ def main(argv: list[str] | None = None) -> int:
         if plan.directory:
             os.chdir(plan.directory)
         _env_file(plan.env_file)
+        if plan.json:
+            # MoP fork (P2): each model's report as one JSON line, for a pool that reads it (``model.Model``).
+            os.environ["CAD_REPORT_JSON"] = "1"
         installation = base.Installation.here()
         prepared = prepare(plan, installation.release)
         spec = prepared.spec
