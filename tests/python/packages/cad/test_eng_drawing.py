@@ -498,7 +498,7 @@ class DrawingDocumentTests(unittest.TestCase):
                 return _sheet(_part())
 
         with self.assertRaisesRegex(ValueError, r"\.pdf"):
-            @eng_drawing(out="../DXF/wrong.dxf")
+            @eng_drawing(out="../DXF/wrong.svg")  # (MoP fork, UV13) .dxf is accepted
             def wrong_suffix():
                 return _sheet(_part())
 

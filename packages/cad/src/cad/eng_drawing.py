@@ -190,14 +190,16 @@ class View:
     def dim(self, p1, p2, *, offset: float | None = None, text: str | None = None, orientation: str | None = None,
             tol: float | tuple[float, float] | None = None, fit: str | None = None) -> "View":
         """A linear dimension between two model points. ``orientation`` is ``"h"``,
-        ``"v"`` or None (whichever the projected pair spans more); ``offset`` is
+        ``"v"``, ``"aligned"`` or None. None (MoP fork, UV58) is aligned: the
+        dimension runs parallel to the projected pair, and a pair already lying
+        along an axis measures as ``"h"`` or ``"v"`` would; ``offset`` is
         the dimension line's distance from the farther point, in sheet mm, and its
         sign picks the side. Left unset, the dimension takes the next free row on
         its side, so defaults never stack on each other or on :meth:`overall`.
         ``tol=0.1`` states ±0.1; ``tol=(0.05, 0.02)`` states +0.05/-0.02
         deviations; ``fit="H7"`` appends an ISO fit class."""
-        if orientation not in (None, "h", "v"):
-            raise ValueError(f"orientation must be 'h', 'v' or None, got {orientation!r}")
+        if orientation not in (None, "h", "v", "aligned"):
+            raise ValueError(f"orientation must be 'h', 'v', 'aligned' or None, got {orientation!r}")
         self._dims.append(_Dim("linear", _p3(p1), _p3(p2), _offset(offset), text, orientation,
                                tol=_tol(tol), fit=fit))
         return self
@@ -619,8 +621,11 @@ class _Projection:
     """The affine map a build123d viewport applies, recovered from the viewport
     itself, so dimension points land exactly where the geometry did."""
 
-    def __init__(self, shape, direction, up) -> None:
+    def __init__(self, shape, direction, up=None) -> None:
         from build123d import Axis, Edge, Vector
+
+        if up is None:  # (MoP fork) upstream's form: a VIEW_DIRECTIONS name
+            direction, up = VIEW_DIRECTIONS[direction]
 
         bbox = shape.bounding_box()
         centre = bbox.center()
@@ -894,6 +899,17 @@ def _fits_at(sheet: Sheet, placed: Sequence[tuple], candidate: float, frame) -> 
 def _spans(a, b) -> str:
     """Whether a projected point pair reads as a horizontal or a vertical dimension."""
     return "h" if abs(b[0] - a[0]) >= abs(b[1] - a[1]) else "v"
+
+
+def _dim_mode(a, b, orientation: str | None) -> str:
+    """(MoP fork, UV58) The mode a linear dimension draws in: the author's choice,
+    else aligned, except that a pair along an axis keeps the upstream h/v path."""
+    if orientation is not None:
+        return orientation
+    dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+    if dx <= 1e-9 * max(dy, 1.0) or dy <= 1e-9 * max(dx, 1.0):
+        return _spans(a, b)
+    return "aligned"
 
 
 def _scale_label(scale: float, digits: str = "g") -> str:
@@ -1289,7 +1305,24 @@ def _render_sheet(sheet: Sheet, *, index: int, count: int, label: str, warnings:
             return _DIM_ROW * rows[side]
 
         def linear(a, b, offset, override, orientation, tol=None, fit=None):
-            horizontal = (orientation or _spans(a, b)) == "h"
+            orientation = _dim_mode(a, b, orientation)
+            if orientation == "aligned":
+                # (MoP fork, UV58) Parallel to the edge between the two points. An
+                # axis-parallel pair never reaches here, so it measures as upstream.
+                if offset is None:
+                    offset = claim_row("top")
+                label = (override or "<>") + (f" {fit}" if fit else "")
+                style_override = {"dimlfac": 1.0 / sv}
+                if tol:
+                    style_override |= {"dimtol": 1, "dimtp": tol[0], "dimtm": tol[1],
+                                       "dimtdec": 2, "dimtfac": 0.7}
+                d = msp.add_aligned_dim(p1=a, p2=b, distance=offset, dimstyle=dimstyle, text=label,
+                                        override=style_override, dxfattribs={"layer": "DIM"})
+                reach["top"] = max(reach["top"], abs(offset) + sheet.text_height * 1.5)
+                d.render()
+                claim_rendered(d.dimension)
+                return
+            horizontal = orientation == "h"
             if offset is None:
                 # Unplaced dimensions go above a horizontal pair and right of a
                 # vertical one, which are the sides `overall()` does not use twice.
@@ -1347,7 +1380,7 @@ def _render_sheet(sheet: Sheet, *, index: int, count: int, label: str, warnings:
             for d in view._dims:
                 if d.kind != "linear":
                     continue
-                horizontal = (d.orientation or _spans(model_to_sheet(d.p1), model_to_sheet(d.p2))) == "h"
+                horizontal = _dim_mode(model_to_sheet(d.p1), model_to_sheet(d.p2), d.orientation) in ("h", "aligned")
                 if horizontal != want_h:
                     continue
                 if d.offset is None:
