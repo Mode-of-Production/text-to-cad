@@ -328,3 +328,156 @@ def test_empty_components_same_as_upstream() -> None:
 
     assert len(dump_empty) == UPSTREAM_THREE_VIEWS_ENTITY_COUNT
     assert sha_empty == UPSTREAM_THREE_VIEWS_ENTITY_SHA256
+
+
+# --- mop_sheet.py (061 T007 second half) ---------------------------------------------
+
+import ast  # noqa: E402
+
+from cad import mop_sheet  # noqa: E402
+from cad.mop_sheet import Balloons, CuttingLine, SectionHatch, Table, _cut, find_pattern  # noqa: E402
+
+
+def _box(x, y, z, at=(0, 0, 0)):
+    from build123d import Align, Box, Pos
+
+    return Pos(*at) * Box(x, y, z, align=(Align.CENTER, Align.CENTER, Align.MIN))
+
+
+def _render_one(*components, shape=None, view_name="top"):
+    sheet = Sheet("A3", title="MOP")
+    view = sheet.view(shape if shape is not None else _part(), view_name, at=(200, 150))
+    sheet.components.extend(c(view) if callable(c) and not hasattr(c, "draw") else c for c in components)
+    doc = _render_sheet(sheet, index=1, count=1, label="m")
+    return sheet, view, doc
+
+
+def _hatches(doc):
+    return [e for e in doc.modelspace() if e.dxftype() == "HATCH"]
+
+
+def _pat_text(angle: float, dash: str = "3") -> str:
+    return f"*TESTPAT, test\n{angle}, 0,0, 0,3, {dash}\n"
+
+
+def test_side_file_imports_within_allow_list() -> None:
+    tree = ast.parse(Path(mop_sheet.__file__).read_text(encoding="utf-8"))
+    allowed = {"math", "os", "re", "pathlib", "typing", "__future__", "build123d", "cad", "ezdxf", "OCP"}
+    roots = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots += [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            roots.append((node.module or "").split(".")[0])
+            if node.module and node.module.startswith("OCP"):
+                assert node.module == "OCP.BRepAlgoAPI"
+    assert [r for r in roots if r not in allowed] == []
+
+
+def test_table_columns() -> None:
+    table = Table((20, 100), ["NO", "NAME", "QTY"], [["1", "BASE", "2"], ["2", "PIN", "4"]], title="PARTS")
+    sheet, view, doc = _render_one(table)
+    texts = [e.dxf.text for e in doc.modelspace() if e.dxftype() == "TEXT" and e.dxf.layer == "TABLE"]
+    for cell in ("1", "BASE", "2", "2", "PIN", "4"):
+        assert cell in texts
+    assert {"NO", "NAME", "QTY", "PARTS"} <= set(texts)
+    assert len(texts) == 6 + 3 + 1
+    x0, y0, x1, y1 = table.bbox
+    W, H = SHEET_SIZES[sheet.size]
+    assert 0 < x0 < x1 < W and 0 < y0 < y1 < H
+
+
+def test_section_hatch_inside_cut_loops() -> None:
+    part = _part()
+    sh = lambda view: SectionHatch(view, [part], (0, 0, 5), (0, 0, 1))  # noqa: E731
+    sheet, view, doc = _render_one(sh)
+    hs = _hatches(doc)
+    assert len(hs) == 1
+    paths = hs[0].paths.paths
+    assert len(paths) >= 2
+    corners = [view.model_to_sheet((sx * 20, sy * 15, 10)) for sx in (-1, 1) for sy in (-1, 1)]
+    xs, ys = [c[0] for c in corners], [c[1] for c in corners]
+    for p in paths:
+        for v in p.vertices:
+            assert min(xs) - 1e-6 <= v[0] <= max(xs) + 1e-6 and min(ys) - 1e-6 <= v[1] <= max(ys) + 1e-6
+
+
+def test_solid_fill() -> None:
+    part = _part()
+    sh = lambda view: SectionHatch(view, [part], (0, 0, 5), (0, 0, 1), pattern="SOLID")  # noqa: E731
+    _, _, doc = _render_one(sh)
+    hs = _hatches(doc)
+    assert len(hs) == 1 and hs[0].dxf.solid_fill == 1
+
+
+def test_cutting_line_on_parent_view() -> None:
+    p1, p2 = (-20.0, 0.0, 10.0), (20.0, 0.0, 10.0)
+    cl = lambda view: CuttingLine(view, p1, p2, "A")  # noqa: E731
+    _, view, doc = _render_one(cl)
+    lines = [e for e in doc.modelspace() if e.dxftype() == "LINE" and e.dxf.layer == "CUTTING"
+             and e.dxf.linetype == "DASHDOT"]
+    assert len(lines) == 1
+    a, b = view.model_to_sheet(p1), view.model_to_sheet(p2)
+    assert (lines[0].dxf.start.x, lines[0].dxf.start.y) == pytest.approx(a)
+    assert (lines[0].dxf.end.x, lines[0].dxf.end.y) == pytest.approx(b)
+    assert [e.dxf.text for e in doc.modelspace() if e.dxftype() == "TEXT" and e.dxf.layer == "CUTTING"] == ["A", "A"]
+
+
+def test_balloons_leader_to_projected_point() -> None:
+    pt = (0.0, 0.0, 10.0)
+    bl = lambda view: Balloons([(view, pt, "7", (260, 200))])  # noqa: E731
+    _, view, doc = _render_one(bl)
+    x, y = view.model_to_sheet(pt)
+    ends = [(e.dxf.end.x, e.dxf.end.y) for e in doc.modelspace() if e.dxftype() == "LINE" and e.dxf.layer == "BALLOON"]
+    assert ends == [pytest.approx((x, y))]
+    assert any(e.dxftype() == "TEXT" and e.dxf.text == "7" for e in doc.modelspace())
+
+
+def test_pat_lookup_session_before_image() -> None:
+    with temporary_directory(prefix="tmp-cad-mop-pat-") as td:
+        session, image = Path(td) / "session", Path(td) / "image"
+        session.mkdir()
+        image.mkdir()
+        (session / "a.pat").write_text(_pat_text(30), encoding="utf-8")
+        (image / "a.pat").write_text(_pat_text(60), encoding="utf-8")
+        assert find_pattern("testpat", search=[session, image])[0][0] == 30
+        assert find_pattern("TESTPAT", search=[image, session])[0][0] == 60
+        with pytest.raises(KeyError):
+            find_pattern("NOPE_NOT_THERE", search=[session])
+
+
+def test_pat_bad_dash_form() -> None:
+    with temporary_directory(prefix="tmp-cad-mop-pat-") as td:
+        (Path(td) / "bad.pat").write_text(_pat_text(45, "3, -1.5.0"), encoding="utf-8")
+        definition = find_pattern("TESTPAT", search=[td])
+        assert list(definition[0][3]) == [3.0, -1.5]
+
+
+def test_section_keeps_normal_side() -> None:
+    box = _box(40, 30, 10)
+    up = _cut(box, (0, 0, 5), (0, 0, 1))
+    down = _cut(box, (0, 0, 5), (0, 0, -1))
+    assert up.volume == pytest.approx(6000.0) and down.volume == pytest.approx(6000.0)
+    assert up.bounding_box().min.Z == pytest.approx(5.0)
+    assert down.bounding_box().max.Z == pytest.approx(5.0)
+    for sign in (1, -1):
+        part = _part()
+        sh = lambda view, s=sign: SectionHatch(view, [part], (0, 0, 5), (0, 0, s))  # noqa: E731
+        _, _, doc = _render_one(sh)
+        assert len(_hatches(doc)[0].paths.paths) >= 2
+
+
+def test_adjacent_parts_alternate_angle() -> None:
+    a, b = _box(20, 20, 10, (-10, 0, 0)), _box(20, 20, 10, (10, 0, 0))
+    sh = lambda view: SectionHatch(view, [a, b], (0, 0, 5), (0, 0, 1), angle=15.0)  # noqa: E731
+    _, _, doc = _render_one(sh, shape=_box(40, 20, 10))
+    hs = _hatches(doc)
+    assert len(hs) == 2
+    assert (hs[1].dxf.pattern_angle - hs[0].dxf.pattern_angle) % 360 == pytest.approx(90.0)
+
+
+def test_hatch_by_part() -> None:
+    a, b = _box(20, 20, 10, (-30, 0, 0)), _box(20, 20, 10, (30, 0, 0))
+    sh = lambda view: SectionHatch(view, {"a": a, "b": b}, (0, 0, 5), (0, 0, 1), by_part={"b": "ANSI37"})  # noqa: E731
+    _, _, doc = _render_one(sh, shape=_box(80, 20, 10))
+    assert [h.dxf.pattern_name for h in _hatches(doc)] == ["ANSI31", "ANSI37"]
