@@ -59,9 +59,9 @@ import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Protocol, Sequence
 
-__all__ = ["eng_drawing", "Sheet", "View", "SHEET_SIZES"]
+__all__ = ["eng_drawing", "Sheet", "SheetComponent", "View", "SHEET_SIZES"]
 
 #: ISO 216 A sizes plus US Letter and Tabloid, landscape, and portrait keys, in millimetres. (MoP fork)
 SHEET_SIZES = {
@@ -174,6 +174,18 @@ class View:
     #: view, so the off-frame guard can lay the same arrangement out again at a
     #: candidate scale. None for a hand-placed ``at=``, which does not move.
     _arranged: tuple | None = None
+    camera: tuple | None = None
+    _model_to_sheet: Callable | None = None
+
+    @property
+    def effective_scale(self) -> float:
+        return self.scale or self.sheet.scale
+
+    @property
+    def model_to_sheet(self) -> Callable:
+        if self._model_to_sheet is None:
+            raise RuntimeError("view is not rendered yet")
+        return self._model_to_sheet
 
     def dim(self, p1, p2, *, offset: float | None = None, text: str | None = None, orientation: str | None = None,
             tol: float | tuple[float, float] | None = None, fit: str | None = None) -> "View":
@@ -376,6 +388,10 @@ def _p3(p) -> tuple[float, float, float]:
     return values  # type: ignore[return-value]
 
 
+class SheetComponent(Protocol):
+    def draw(self, msp, sheet: "Sheet", frame: tuple[float, float, float, float]) -> None: ...
+
+
 @dataclass
 class Sheet:
     """One sheet of a drawing: a frame, a title block and the views placed on it.
@@ -401,6 +417,7 @@ class Sheet:
     #: Revision history rows (rev, date, description), drawn as a table top-right.
     revisions: Sequence[tuple[str, str, str]] = ()
     views: list[View] = field(default_factory=list)
+    components: list[SheetComponent] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.size not in SHEET_SIZES:
@@ -489,10 +506,9 @@ class Sheet:
             view._arranged = (size, gap, iso)
         return views
 
-    def view(self, shape, name: str, *, at, label: str | None = None, hidden: bool = True, centre_marks: bool = True,
-             scale: float | None = None) -> View:
-        if name not in VIEW_DIRECTIONS:
-            raise ValueError(f"unknown view {name!r}; one of {sorted(VIEW_DIRECTIONS)}")
+    def _build_view(self, shape, name: str, camera: tuple[tuple[float, float, float], tuple[float, float, float]], *,
+                    at, label: str | None = None, hidden: bool = True, centre_marks: bool = True,
+                    scale: float | None = None) -> View:
         if scale is not None and not (scale > 0):
             raise ValueError("a view's scale must be positive")
         # A non-finite at= compares False against every frame edge, so the off-frame
@@ -504,9 +520,40 @@ class Sheet:
             raise TypeError(f"view at= must be an (x, y) pair of sheet millimetres, got {at!r}") from exc
         if not (math.isfinite(at[0]) and math.isfinite(at[1])):
             raise ValueError(f"view at= must be finite sheet millimetres, got {at!r}")
-        view = View(self, shape, name, at, label, hidden, centre_marks, scale)
+        view = View(self, shape, name, at, label, hidden, centre_marks, scale, camera=camera)
         self.views.append(view)
         return view
+
+    def view(self, shape, name: str, *, at, label: str | None = None, hidden: bool = True, centre_marks: bool = True,
+             scale: float | None = None) -> View:
+        if name not in VIEW_DIRECTIONS:
+            raise ValueError(f"unknown view {name!r}; one of {sorted(VIEW_DIRECTIONS)}")
+        return self._build_view(shape, name, VIEW_DIRECTIONS[name], at=at, label=label, hidden=hidden,
+                                centre_marks=centre_marks, scale=scale)
+
+    def view_from(self, shape, direction, up, *, at, label: str | None = None, hidden: bool = True,
+                  centre_marks: bool = True, scale: float | None = None) -> View:
+        if isinstance(direction, (str, bytes)) or isinstance(up, (str, bytes)):
+            raise ValueError("direction and up must be 3D vectors")
+        try:
+            dx, dy, dz = (float(v) for v in direction)
+            ux, uy, uz = (float(v) for v in up)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"direction and up must be 3-number vectors, got {direction!r}, {up!r}") from exc
+        if not all(math.isfinite(c) for c in (dx, dy, dz, ux, uy, uz)):
+            raise ValueError(f"direction and up components must be finite, got {direction!r}, {up!r}")
+        nd = math.sqrt(dx * dx + dy * dy + dz * dz)
+        nu = math.sqrt(ux * ux + uy * uy + uz * uz)
+        if not (nd > 0.0 and nu > 0.0):
+            raise ValueError(f"direction and up must be non-zero vectors, got {direction!r}, {up!r}")
+        cx = dy * uz - dz * uy
+        cy = dz * ux - dx * uz
+        cz = dx * uy - dy * ux
+        nc = math.sqrt(cx * cx + cy * cy + cz * cz)
+        if nc < 1e-9 * nd * nu:
+            raise ValueError(f"up vector {up!r} must not be parallel to direction {direction!r}")
+        return self._build_view(shape, "custom", ((dx, dy, dz), (ux, uy, uz)), at=at, label=label,
+                                hidden=hidden, centre_marks=centre_marks, scale=scale)
 
 
 # --- projection ---------------------------------------------------------------------
@@ -572,10 +619,9 @@ class _Projection:
     """The affine map a build123d viewport applies, recovered from the viewport
     itself, so dimension points land exactly where the geometry did."""
 
-    def __init__(self, shape, name: str) -> None:
+    def __init__(self, shape, direction, up) -> None:
         from build123d import Axis, Edge, Vector
 
-        direction, up = VIEW_DIRECTIONS[name]
         bbox = shape.bounding_box()
         centre = bbox.center()
         radius = max(bbox.size.length, 1.0)
@@ -657,7 +703,7 @@ def _edges_bounds(edges) -> tuple[float, float, float, float] | None:
 
 def _view_extent(shape, name: str, scale: float) -> tuple[float, float]:
     """The projected (width, height) of a view in sheet millimetres, for placement."""
-    proj = _Projection(shape, name)
+    proj = _Projection(shape, *VIEW_DIRECTIONS[name])
     bounds = _edges_bounds(list(proj.visible) + list(proj.hidden))
     if not bounds:
         return (0.0, 0.0)
@@ -1064,6 +1110,7 @@ def _render_sheet(sheet: Sheet, *, index: int, count: int, label: str, warnings:
     # Frame and title block.
     m = _MARGIN
     msp.add_lwpolyline([(m, m), (W - m, m), (W - m, H - m), (m, H - m)], close=True, dxfattribs={"layer": "SHEET"})
+    frame = (m, m, W - m, H - m)
     tw, th = min(_TITLE_W, W - 2 * m), _TITLE_H
     x0, y0 = W - m - tw, m
     msp.add_lwpolyline([(x0, y0), (x0 + tw, y0), (x0 + tw, y0 + th), (x0, y0 + th)], close=True, dxfattribs={"layer": "TITLE"})
@@ -1103,7 +1150,7 @@ def _render_sheet(sheet: Sheet, *, index: int, count: int, label: str, warnings:
     s = sheet.scale
     placed = []
     for view in sheet.views:
-        proj = _Projection(view.shape, view.name)
+        proj = _Projection(view.shape, *view.camera)
         bounds = _edges_bounds(list(proj.visible) + (list(proj.hidden) if view.hidden else []))
         if not bounds:
             continue
@@ -1132,11 +1179,13 @@ def _render_sheet(sheet: Sheet, *, index: int, count: int, label: str, warnings:
         sv = view.scale or s
         # Centre the projected geometry on `at`.
 
-        def to_sheet(p2):
-            return (view.at[0] + (p2[0] - cx) * sv, view.at[1] + (p2[1] - cy) * sv)
+        def to_sheet(p2, _at=view.at, _cx=cx, _cy=cy, _sv=sv):
+            return (_at[0] + (p2[0] - _cx) * _sv, _at[1] + (p2[1] - _cy) * _sv)
 
-        def model_to_sheet(p3):
-            return to_sheet(proj.point(p3))
+        def model_to_sheet(p3, _to_sheet=to_sheet, _proj=proj):
+            return _to_sheet(_proj.point(p3))
+
+        view._model_to_sheet = model_to_sheet
 
         # One set for the whole view, not one per pass. HLR returns an edge from
         # every face that bounds it, so an edge on the silhouette comes back
@@ -1409,6 +1458,8 @@ def _render_sheet(sheet: Sheet, *, index: int, count: int, label: str, warnings:
         # dimension on the bottom side never sits on it.
         text((view.label or view.name).upper(), view.at[0], vy0 - reach["bottom"] - 6, 3.5,
              TextEntityAlignment.TOP_CENTER, "NOTES")
+    for c in sheet.components:
+        c.draw(msp, sheet, frame)
     return doc
 
 
@@ -1511,8 +1562,9 @@ def eng_drawing(func: Callable[..., Any] | None = None, *, out: str | Path | Non
                 "and the library does not choose where it lands."
             )
         target_spec = Path(out)
-        if target_spec.suffix.lower() != ".pdf":
-            raise ValueError(f"@eng_drawing out= must name a .pdf, got {out!r}")
+        suffix = target_spec.suffix.lower()
+        if suffix not in (".pdf", ".dxf"):
+            raise ValueError(f"@eng_drawing out= must name a .pdf or .dxf, got {out!r}")
         script = Path(inspect.getsourcefile(fn) or inspect.getfile(fn)).resolve()
 
         @functools.wraps(fn)
@@ -1521,6 +1573,8 @@ def eng_drawing(func: Callable[..., Any] | None = None, *, out: str | Path | Non
             sheets = list(result) if isinstance(result, (list, tuple)) else [result]
             if not sheets or not all(isinstance(s, Sheet) for s in sheets):
                 raise TypeError(f"@eng_drawing {fn.__name__} must return a Sheet or a list of Sheets")
+            if suffix == ".dxf" and len(sheets) != 1:
+                raise ValueError(f"@eng_drawing {fn.__name__} with .dxf out= accepts only 1 Sheet, got {len(sheets)}")
             from cad.engine.export.dxf import raise_on_error_findings, validate_drawing_document
 
             target = target_spec if target_spec.is_absolute() else (script.parent / target_spec).resolve()
@@ -1543,7 +1597,11 @@ def eng_drawing(func: Callable[..., Any] | None = None, *, out: str | Path | Non
                 docs.append(doc)
             for notice in notices:
                 print(f"{fn.__name__}: {notice}")
-            _write_pdf(docs, sheets, target)
+            if suffix == ".dxf":
+                target.parent.mkdir(parents=True, exist_ok=True)
+                docs[0].saveas(target)
+            else:
+                _write_pdf(docs, sheets, target)
             print(f"wrote {target} ({len(sheets)} page{'s' if len(sheets) != 1 else ''})")
             return [target]
 
