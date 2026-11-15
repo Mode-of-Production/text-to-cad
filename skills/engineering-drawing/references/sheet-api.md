@@ -12,7 +12,7 @@ from cad.eng_drawing import Sheet, eng_drawing
 from enclosure import HOLES, L, H, W, enclosure
 
 
-@eng_drawing(out="../PDF/enclosure_drawing.pdf")
+@eng_drawing(out="enclosure_drawing.pdf")   # or ".dxf" (1 Sheet); relative to this script's folder
 def enclosure_drawing():
     part = enclosure().shape    # the model, built by the server (a replay when it holds it)
     sheet = Sheet("A3", title="ENCLOSURE", part_number="ENC-001", material="ABS",
@@ -31,14 +31,20 @@ if __name__ == "__main__":
     enclosure_drawing()
 ```
 
-## `@eng_drawing(out="<path>.pdf")`
+## `@eng_drawing(out="<path>.pdf" | "<path>.dxf")`
 
-Declares the drawing. The function returns a `Sheet` or a list of them. Calling
-it renders one PDF at `out`, a page per sheet, and returns `[path]`.
+Declares the drawing. For a `.pdf` `out`, the function returns a `Sheet` or a
+list of them, renders one PDF at `out` (one page per sheet), and returns
+`[path]`. For a `.dxf` `out`, the function returns a single `Sheet` (more than
+one raises `ValueError`), validates and saves that sheet's ezdxf drawing
+document to `out` (`saveas`), and returns `[path]`. Inspect a `.pdf` drawing by
+reading the PDF; inspect a `.dxf` drawing by running
+`cad dxf snapshot <dxf> <png>` and reading the PNG.
 
-`out` is required and must name a `.pdf`; a relative path resolves against the
-script. text-to-cad has no default location — where a document belongs is the
-caller's decision. Both are checked when the module is imported, not when the
+`out` is required and must name a `.pdf` or `.dxf`; a relative path resolves
+against the script's folder, not the working directory. text-to-cad has no
+default location — where a document belongs is the caller's decision. `out` and
+its `.pdf`/`.dxf` suffix are checked when the module is imported, not when the
 drawing runs.
 
 There is no `eng_drawing` CLI verb. A `Sheet` is composed in Python — views,

@@ -8,13 +8,16 @@ drawing follows the part: change the model, rerun the drawing script, and the
 views, hidden lines and measured values move with it. Nothing on the sheet is
 drawn by hand.
 
-The output is one PDF. A shop receives a PDF, every operating system opens and
+``out=`` names a ``.pdf`` (one page per sheet) or a ``.dxf`` (one ``Sheet``,
+saving its ezdxf document with ``saveas``); a relative ``out=`` resolves against
+the script's folder. A shop receives a PDF, every operating system opens and
 marks one up, and nothing here pairs the document with a second file. ezdxf is
-the in-memory drawing engine -- real ``DIMENSION`` entities so the value is
-measured and the arrowheads and witness lines are the dimension style's, ``TEXT``
-for notes and the title block, a LAYER table whose linetypes say which lines are
-hidden or centre lines -- and no ``.dxf`` reaches disk. ``@dxf`` remains the
-decorator for a DXF: a cut layout is a toolpath, and a drawing is not.
+the drawing engine -- real ``DIMENSION`` entities so the value is measured and
+the arrowheads and witness lines are the dimension style's, ``TEXT`` for notes
+and the title block, a LAYER table whose linetypes say which lines are hidden or
+centre lines -- looked at by reading the PDF, or for ``.dxf`` by
+``cad dxf snapshot <dxf> <png>`` and reading the PNG. ``@dxf`` remains the
+decorator for a cut layout: a cut layout is a toolpath, and a drawing is not.
 
 Usage::
 

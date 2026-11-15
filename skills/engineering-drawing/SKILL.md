@@ -1,6 +1,6 @@
 ---
 name: engineering-drawing
-description: Make an engineering drawing of a part as a PDF - orthographic views with hidden lines and centre marks, real dimensions, hole callouts, notes and a title block on ISO sheets, all projected from the part's geometry so the drawing follows the model. Use when the user asks for a drawing, a dimensioned sheet, shop or manufacturing drawings, a print, or "2D views of this part". Not for DXF cut layouts or flat patterns.
+description: Make an engineering drawing of a part as a PDF or DXF - orthographic views with hidden lines and centre marks, real dimensions, hole callouts, notes and a title block on ISO sheets, all projected from the part's geometry so the drawing follows the model. Use when the user asks for a drawing, a dimensioned sheet, shop or manufacturing drawings, a print, or "2D views of this part". Not for DXF cut layouts or flat patterns.
 license: MIT
 metadata:
   repository: earthtojake/text-to-cad
@@ -16,10 +16,12 @@ script, and the views, hidden lines and measured values move with it. Nothing
 on the sheet is drawn by hand, and nothing on it is a number you typed unless
 you chose to override a value.
 
-**The output is one PDF.** That is what a shop receives and what every
-operating system opens. No DXF is written, nothing is paired or linked, and
-there is no CLI: the script is the interface. Cut layouts and flat patterns are
-toolpaths, not documents, and a different job.
+**`out=` names a `.pdf` (one page per sheet) or a `.dxf` (one `Sheet`, saving
+its ezdxf drawing document with `saveas`); a relative `out=` resolves against
+the script's folder.** A PDF is what a shop receives and what every operating
+system opens. Nothing is paired or linked, and there is no drawing CLI: the
+script is the interface. Cut layouts and flat patterns are toolpaths, not
+documents, and a different job.
 
 ## Setup
 
@@ -63,8 +65,8 @@ only just added, its server may still be starting: try again for up to a minute 
    wider than the sheet's note column is refused, and `notes=` takes a LIST
    (`notes="BREAK EDGES"` is a sequence of eleven characters, so it is refused
    too).
-5. Run `cad run <name>_drawing.py`. It prints the PDF it wrote, and **anything
-   it noticed while drawing** — read those first:
+5. Run `cad run <name>_drawing.py`. It prints the `.pdf` or `.dxf` path it wrote,
+   and **anything it noticed while drawing** — read those first:
    - *"measures blank paper"*: the dimension's model points do not land on the
      view's geometry. Almost always the part was built from a corner and the
      script assumed it was centred. Check the part's bounding box.
@@ -76,11 +78,13 @@ only just added, its server may still be starting: try again for up to a minute 
      values clear each other.
 
    Steps 3 and 5 stand on their own: a sheet of views with no dimensions on it
-   yet is a drawing, and writes its PDF.
+   yet is a drawing, and writes its `.pdf` or `.dxf`.
 
    When running unattended, set `MPLCONFIGDIR` to a writable directory so
    matplotlib's font cache does not warn.
-6. **Read the PDF** and fix what collides. Check that no dimension text sits on
+6. **Inspect the output** — read the PDF for a `.pdf` drawing, or run
+   `cad dxf snapshot <dxf> <png>` and read the PNG for a `.dxf` drawing — and
+   fix what collides. Check that no dimension text sits on
    a view, that hidden lines appear where features are behind faces, that every
    hole has a centre mark, and that no leader crosses the part. Very small
    dimensions (a few mm) put their value on their own extension line; dimension
@@ -119,10 +123,12 @@ The script raises rather than writing a wrong or missing document:
   `notes=` or `revisions=` given a bare string, a note wider than the sheet,
   `angle()` legs that are collinear or zero-length, a non-finite `at=` or
   `offset=`.
-- A missing renderer. The PDF is the drawing, so no matplotlib is a failure,
-  not a skipped half. A failed render leaves no file
-  it wrote; an earlier PDF stays byte for byte.
-- `out=` missing or not naming a `.pdf`, at import time.
+- A missing PDF renderer when `out=` names a `.pdf`: no matplotlib is a failure,
+  not a skipped half, and a failed render leaves an earlier PDF byte for byte
+  (`out=` naming a `.dxf` saves the validated single-sheet ezdxf document
+  directly).
+- `out=` missing or not naming a `.pdf` or `.dxf`, at import time; or `.dxf`
+  `out=` given anything other than a single `Sheet`, at run time.
 
 ## Limits to state in the handoff
 
@@ -133,4 +139,5 @@ The script raises rather than writing a wrong or missing document:
   sections, details, or auxiliary views yet. Say what a view does not show.
 - The sheet keeps callouts clear of the views it knows about, and reports
   annotation that still prints over other annotation, but it does not check
-  annotation against line work. Read the PDF.
+  annotation against line work. Read the PDF, or for a `.dxf` drawing run
+  `cad dxf snapshot <dxf> <png>` and read the PNG.
