@@ -463,6 +463,10 @@ def main(argv: list[str] | None = None) -> int:
         assert isinstance(spec, extras.Spec)
         if spec.python is None:
             _admitted(prepared.wanted, installation.python or platform.python_version(), script, "the server's")
+        if os.environ.get("CAD_RUN_PKGS_DIR"):  # MoP fork (061 UV47)
+            from cad_server import mop_pkgs
+
+            prepared, spec = mop_pkgs.settle(installation, prepared, spec, told=said)
         if spec.default():
             env = base.ensure(installation, told=said, engine=True)
         else:
