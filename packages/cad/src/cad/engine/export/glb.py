@@ -102,13 +102,27 @@ def write(view: Any, path: Path) -> None:
 
     def mesh_of(index: int, color: tuple | None) -> int | None:
         key = (index, color)
-        found = mesh_at.get(key)
-        if found is not None:
-            return found
+        if key in mesh_at:
+            return mesh_at[key]
         mesh = held[index]
-        if not mesh.triangles:
-            return None
         prototype = view.prototypes[index]
+        if not mesh.triangles:
+            if prototype["key"] not in view.source.shapes:
+                mesh_at[key] = None
+                return None
+            from dataclasses import replace
+            from cad.engine.mesh import polylines
+
+            lines = polylines(view.source.shape_data(prototype["key"]))
+            if not lines:
+                mesh_at[key] = None
+                return None
+            held[index] = replace(mesh, positions=np.concatenate(lines))
+            primitives = [{"attributes": {"POSITION": add(np.ascontiguousarray(line, "<f4"), 34962, "VEC3", 5126)},
+                           "mode": 3} for line in lines]
+            gltf_meshes.append({"name": prototype["name"], "primitives": primitives})
+            found = mesh_at[key] = len(gltf_meshes) - 1
+            return found
         if index not in shared:
             shared[index] = (add(np.ascontiguousarray(mesh.positions, "<f4"), 34962, "VEC3", 5126),
                              add(np.ascontiguousarray(mesh.normals, "<f4"), 34962, "VEC3", 5126), {})
@@ -144,7 +158,7 @@ def write(view: Any, path: Path) -> None:
         own = held[placed.prototype]
         color = placed.color if placed.color is not None and placed.color != _tuple(
             view.prototypes[placed.prototype].get("color")) else None
-        index = mesh_of(placed.prototype, color) if own.triangles else None
+        index = mesh_of(placed.prototype, color if own.triangles else None)
         if index is None:
             continue
         nodes.append({"name": "/".join(placed.path[1:]) or placed.path[-1], "mesh": index,

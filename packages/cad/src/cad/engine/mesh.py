@@ -217,6 +217,67 @@ def mesh_shape(shape: Any, *, parallel: bool = True, tolerance: float | None = N
     return mesh
 
 
+def polylines(shape: Any) -> list[np.ndarray]:
+    """One float32 (N, 3) polyline per wire of ``shape``, or per free edge outside any wire,
+    discretized at ``deflection(local)`` and ``ANGULAR``."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.GCPnts import GCPnts_TangentialDeflection
+    from OCP.GeomAbs import GeomAbs_Line
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_REVERSED, TopAbs_WIRE
+    from OCP.TopExp import TopExp, TopExp_Explorer
+
+    local = read_shape(shape if isinstance(shape, (bytes, bytearray, memoryview)) else shape_bytes(shape))
+    linear = deflection(local)
+
+    def sample(edge: Any, rev: bool) -> tuple[list[tuple[float, float, float]], Any, Any]:
+        curve = BRepAdaptor_Curve(edge)
+        u0, u1 = curve.FirstParameter(), curve.LastParameter()
+        if curve.GetType() == GeomAbs_Line:
+            raw = [curve.Value(u0), curve.Value(u1)]
+        else:
+            gen = GCPnts_TangentialDeflection(curve, ANGULAR, linear)
+            raw = [gen.Value(i) for i in range(1, gen.NbPoints() + 1)]
+        pts = [(p.X(), p.Y(), p.Z()) for p in raw]
+        fv, lv = TopExp.FirstVertex_s(edge, False), TopExp.LastVertex_s(edge, False)
+        return (pts[::-1], lv, fv) if rev else (pts, fv, lv)
+
+    found: list[np.ndarray] = []
+    wires = TopExp_Explorer(local, TopAbs_WIRE)
+    while wires.More():
+        explorer = BRepTools_WireExplorer(TopoDS.Wire(wires.Current()))
+        pts: list[tuple[float, float, float]] = []
+        first_v = prev_v = None
+        while explorer.More():
+            edge = explorer.Current()
+            if not BRep_Tool.Degenerated_s(edge):
+                epts, fv, lv = sample(edge, explorer.Orientation() == TopAbs_REVERSED)
+                if prev_v is not None and ((not fv.IsNull() and fv.IsSame(prev_v))
+                                           or (pts and math.dist(pts[-1], epts[0]) <= 1e-7)):
+                    epts = epts[1:]
+                elif first_v is None:
+                    first_v = fv
+                pts.extend(epts)
+                prev_v = lv
+            explorer.Next()
+        if len(pts) >= 2:
+            if first_v is not None and prev_v is not None and not first_v.IsNull() and prev_v.IsSame(first_v):
+                pts[-1] = pts[0]
+            found.append(np.asarray(pts, dtype=np.float32))
+        wires.Next()
+    edges = TopExp_Explorer(local, TopAbs_EDGE, TopAbs_WIRE)
+    while edges.More():
+        edge = TopoDS.Edge(edges.Current())
+        if not BRep_Tool.Degenerated_s(edge):
+            epts, fv, lv = sample(edge, edge.Orientation() == TopAbs_REVERSED)
+            if len(epts) >= 2:
+                if not fv.IsNull() and fv.IsSame(lv):
+                    epts[-1] = epts[0]
+                found.append(np.asarray(epts, dtype=np.float32))
+        edges.Next()
+    return found
+
+
 # --- the B-rep's own facts -----------------------------------------------------------------
 
 
